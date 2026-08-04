@@ -92,8 +92,16 @@ Doc::Doc(std::optional<uint64_t> clientId) {
 Doc::~Doc() = default;
 
 Item* Doc::alloc() {
-  items_.push_back(std::make_unique<Item>());
-  return items_.back().get();
+  auto it = std::make_unique<Item>();
+  Item* p = it.get();
+  items_.emplace(p, std::move(it));
+  return p;
+}
+
+size_t Doc::structCount() const {
+  size_t n = 0;
+  for (const auto& [client, v] : store_) n += v.size();
+  return n;
 }
 
 Text& Doc::getText(const std::string& name) {
@@ -185,6 +193,47 @@ void Doc::markDeleted(Item* s) {
   if (s->deleted) return;
   s->deleted = true;
   if (s->countable() && s->parent) s->parent->length -= s->len;
+  // Garbage-collect the content right away (yjs Item.gc with a live parent:
+  // content becomes ContentDeleted, keeping only the clock length). Sync needs
+  // the length, not the characters, and we have no observers reading them.
+  if (s->kind == ContentKind::String) {
+    s->kind = ContentKind::Deleted;
+    s->str.clear();
+    s->str.shrink_to_fit();
+  }
+}
+
+// Port of yjs Item.mergeWith / tryToMergeWithLefts: absorb v[pos] into
+// v[pos-1] when both halves are one contiguous run in the same list state.
+bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
+  if (pos == 0 || pos >= v.size()) return false;
+  Item* l = v[pos - 1];
+  Item* r = v[pos];
+  if (l->kind != r->kind || l->deleted != r->deleted) return false;
+  if (l->id.clock + l->len != r->id.clock) return false;
+  if (l->kind != ContentKind::GC) {
+    if (l->right != r) return false;
+    if (!r->origin || !(*r->origin == l->lastId())) return false;
+    if (!sameOpt(l->rightOrigin, r->rightOrigin)) return false;
+  }
+  if (l->kind == ContentKind::String) l->str += r->str;
+  l->len += r->len;
+  if (l->kind != ContentKind::GC) {
+    l->right = r->right;
+    if (r->right) r->right->left = l;
+  }
+  v.erase(v.begin() + static_cast<long>(pos));
+  items_.erase(r);
+  return true;
+}
+
+void Doc::mergeAround(uint64_t client, uint64_t clock) {
+  auto sit = store_.find(client);
+  if (sit == store_.end() || sit->second.empty()) return;
+  auto& v = sit->second;
+  size_t pos = findIndex(v, clock);
+  tryMergeWithLeft(v, pos + 1);  // right neighbor into this item
+  tryMergeWithLeft(v, pos);      // this item into its left neighbor
 }
 
 // ---------------------------------------------------------------- integration
@@ -214,6 +263,8 @@ void Doc::integrateAsGc(Item* it, uint64_t offset) {
   it->str.clear();
   it->left = it->right = nullptr;
   addStruct(it);
+  auto& v = store_[it->id.client];
+  tryMergeWithLeft(v, v.size() - 1);
 }
 
 // Port of yjs Item.getMissing (neighbor/parent resolution) + Item.integrate
@@ -315,6 +366,9 @@ void Doc::integrate(Item* it, uint64_t offset) {
 
   if (it->countable() && !it->deleted) it->parent->length += it->len;
   addStruct(it);
+  // Compact: a run typed by one client collapses back into a single item.
+  auto& v = store_[it->id.client];
+  tryMergeWithLeft(v, v.size() - 1);
 }
 
 void Doc::integrateLoop() {
@@ -362,6 +416,11 @@ DeleteRange Doc::applyDeleteRange(uint64_t client, uint64_t clock, uint64_t len)
         if (applyEnd < s->id.clock + s->len) splitItem(s, applyEnd - s->id.clock);
         markDeleted(s);
       }
+    }
+    // Compact the freshly deleted run (and its boundaries) into merged tombstones.
+    size_t pos = findIndex(v, clock);
+    while (pos < v.size() && v[pos]->id.clock <= applyEnd) {
+      if (!tryMergeWithLeft(v, pos)) pos++;
     }
   }
   uint64_t restStart = std::max(clock, applyEnd);
@@ -695,14 +754,18 @@ void Text::remove(uint64_t index, uint64_t delLen) {
     right = right->right;
   }
   uint64_t remaining = delLen;
+  std::vector<ID> marked;
   while (remaining > 0 && right) {
     if (!right->deleted && right->countable()) {
       if (remaining < right->len) d.splitItem(right, remaining);
       d.markDeleted(right);
+      marked.push_back(right->id);
       remaining -= right->len;
     }
     right = right->right;
   }
+  // Compact after the walk (merging during it would invalidate the traversal).
+  for (const ID& id : marked) d.mergeAround(id.client, id.clock);
 }
 
 std::u16string Text::toUtf16() const {

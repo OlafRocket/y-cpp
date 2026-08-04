@@ -284,6 +284,59 @@ TEST(sync_surrogate_split) {
   checkEq(a.getText().length, uint64_t(3), "3 units");
 }
 
+// ----------------------------------------------------------- compaction
+
+TEST(compaction_sequential_typing) {
+  ycpp::Doc d(1);
+  auto& t = d.getText();
+  for (int i = 0; i < 50; i++) t.insert(t.length, "x");
+  checkEq(t.length, uint64_t(50), "all chars present");
+  checkEq(d.structCount(), size_t(1), "typed run merged into one struct");
+  ycpp::Doc b(2);
+  b.applyUpdate(d.encodeStateAsUpdate());
+  checkEq(b.getText().toString(), t.toString(), "receiver text matches");
+  checkEq(b.structCount(), size_t(1), "receiver also compacts");
+}
+
+TEST(compaction_tombstones_and_gc) {
+  ycpp::Doc d(1);
+  auto& t = d.getText();
+  t.insert(0, std::string(500, 'a'));
+  t.remove(0, 500);
+  checkEq(t.toString(), std::string(""), "text empty");
+  checkEq(d.structCount(), size_t(1), "tombstones merged into one struct");
+  auto u = d.encodeStateAsUpdate();
+  check(u.size() < 40, "gc'd update is tiny (" + std::to_string(u.size()) + " bytes)");
+  ycpp::Doc b(2);
+  b.applyUpdate(u);
+  checkEq(b.getText().toString(), std::string(""), "gc'd update applies cleanly");
+}
+
+TEST(compaction_delete_char_by_char) {
+  ycpp::Doc d(1);
+  auto& t = d.getText();
+  t.insert(0, "abcdefghij");
+  for (int i = 0; i < 10; i++) t.remove(0, 1);
+  checkEq(t.toString(), std::string(""), "all deleted");
+  checkEq(d.structCount(), size_t(1), "char-by-char deletes compact");
+}
+
+TEST(compaction_preserves_convergence) {
+  // Splitting a previously merged item must reconstruct the original
+  // origins exactly (merge conditions guarantee it) — sync both ways.
+  ycpp::Doc a(1), b(2);
+  for (int i = 0; i < 5; i++) {
+    a.getText().insert(a.getText().length, std::string(1, static_cast<char>('a' + i)));
+  }
+  checkEq(a.structCount(), size_t(1), "run merged on a");
+  sync(a, b);
+  b.getText().insert(2, "XY");  // forces a split of the merged item
+  a.getText().remove(1, 2);
+  sync(a, b);
+  sync(a, b);
+  checkEq(a.getText().toString(), b.getText().toString(), "converged after split of merged item");
+}
+
 // ----------------------------------------------------------------- fuzz
 
 TEST(fuzz_random_ops_converge) {

@@ -53,7 +53,11 @@ ported exactly — it is the heart of conflict resolution.
 Items must be **splittable** at any UTF-16 offset (a remote peer may insert
 into the middle of a run, or delete half of it). Splitting inside a surrogate
 pair replaces both halves' boundary units with U+FFFD, exactly like yjs.
-Merging adjacent items is an optional optimization and is *not* required.
+Merging adjacent items is an optional optimization and is *not* required for
+conformity — y-cpp implements it since 0.2 (yjs `Item.mergeWith` conditions:
+same client, contiguous clocks, list-adjacent, matching origins and deleted
+flag). The conditions guarantee a later split reconstructs the original
+origins exactly, so merging is invisible on the wire.
 
 ### 1.3 Content types (minimal subset)
 
@@ -126,10 +130,17 @@ websocket transport are *not* part of the core and are out of scope.)
 - Rich-text formatting attributes and embeds (`ContentFormat`, `ContentEmbed`).
 - Undo manager, snapshots, relative positions.
 - Observers/events, transactions with origin tracking.
-- Garbage collection / item merging (we keep tombstones; we still *accept*
-  GC structs from peers).
 - Awareness protocol and any network transport (sync is byte-array in/out;
   the demo exchanges base64 blobs).
+
+Implemented since 0.2 (was out of scope in 0.1):
+
+- Item merging and tombstone garbage collection: deleted string content is
+  replaced with `ContentDeleted` (yjs `Item.gc` with a live parent) and
+  adjacent mergeable items are compacted, mirroring yjs's transaction
+  cleanup. Tombstones themselves are kept — replacing whole structs with
+  `GC` only applies to deleted *parents*, which cannot occur with root-only
+  types.
 
 ## 3. Conformity test strategy
 

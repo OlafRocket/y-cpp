@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ycpp/lib0.hpp"
@@ -100,6 +101,11 @@ class Doc {
   // True if some received structs/deletes still await missing dependencies.
   bool hasPending() const { return !pending_.empty() || !pendingDs_.empty(); }
 
+  // Number of structs in the store (across all clients). Adjacent items are
+  // merged and tombstone content is garbage-collected, so this stays bounded
+  // by the document's current shape, not by the length of the edit history.
+  size_t structCount() const;
+
  private:
   friend struct Text;
 
@@ -110,6 +116,10 @@ class Doc {
   Item* getItemCleanEnd(const ID& id);
   Item* splitItem(Item* it, uint64_t diff);
   void markDeleted(Item* s);
+  // Merges v[pos] into v[pos-1] if the yjs merge conditions hold (frees v[pos]).
+  bool tryMergeWithLeft(std::vector<Item*>& v, size_t pos);
+  // Attempts merges around the struct containing (client, clock).
+  void mergeAround(uint64_t client, uint64_t clock);
 
   bool depsMissing(const Item* it) const;
   void integrate(Item* it, uint64_t offset);
@@ -133,7 +143,7 @@ class Doc {
   uint64_t clientId_;
   std::map<uint64_t, std::vector<Item*>> store_;          // per client, sorted by clock
   std::map<std::string, std::unique_ptr<Text>> types_;    // root types
-  std::vector<std::unique_ptr<Item>> items_;              // ownership of all items
+  std::unordered_map<Item*, std::unique_ptr<Item>> items_;  // ownership; erased on merge
   std::map<uint64_t, std::deque<Item*>> pending_;         // structs awaiting deps
   std::map<uint64_t, std::vector<DeleteRange>> pendingDs_;  // deletes awaiting structs
 };

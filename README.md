@@ -20,6 +20,9 @@ lib0 v1 update codec); the Rust implementation
   `encodeStateVector`, state-vector–based diff sync
 - YATA conflict resolution — byte-for-byte the same ordering decisions as yjs
 - Tombstone deletes with DeleteSets, item splitting, GC structs from peers
+- Item merging + tombstone garbage collection (since 0.2): adjacent items
+  merge back together and deleted content is dropped, so memory and update
+  size are bounded by the document's current content, not its edit history
 - Out-of-order update delivery (pending structs/deletes, retried and
   preserved across re-encodes)
 
