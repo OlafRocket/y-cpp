@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "ycpp/base64.hpp"
+#include "../tools/base64_io.hpp"
 #include "ycpp/lib0.hpp"
 #include "ycpp/utf.hpp"
 #include "ycpp/ycpp.hpp"
@@ -98,8 +98,21 @@ TEST(base64_roundtrip) {
   std::vector<uint8_t> data = {0, 1, 2, 250, 255, 100, 42};
   for (size_t n = 0; n <= data.size(); n++) {
     std::vector<uint8_t> in(data.begin(), data.begin() + n);
-    checkEq(ycpp::base64::decode(ycpp::base64::encode(in)), in, "base64 roundtrip len " + std::to_string(n));
+    checkEq(ycpp_tools::base64Decode(ycpp_tools::base64Encode(in)), in,
+            "base64 roundtrip len " + std::to_string(n));
   }
+  // Whitespace from stdin/copy-paste is tolerated.
+  std::vector<uint8_t> hey = {'h', 'e', 'y'};
+  checkEq(ycpp_tools::base64Decode("aGV5\n"), hey, "trailing newline tolerated");
+  checkEq(ycpp_tools::base64Decode(" aG\r\nV5 "), hey, "embedded whitespace tolerated");
+  // Invalid input reports an error instead of decoding garbage.
+  bool threw = false;
+  try {
+    ycpp_tools::base64Decode("not*base64!");
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  check(threw, "invalid character throws");
 }
 
 // ----------------------------------------------------------------- local text

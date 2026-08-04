@@ -106,4 +106,6 @@ b.applyUpdate(a.encodeStateAsUpdate(b.encodeStateVector()));
 ## License
 
 MIT (see LICENSE). Portions are ported from [yjs](https://github.com/yjs/yjs)
-(MIT, © Kevin Jahns).
+(MIT, © Kevin Jahns). `third_party/` contains the vendored
+[macaron Base64](https://github.com/tomykaira/Base64.h) codec (MIT,
+© 2016 tomykaira) used by the CLI.

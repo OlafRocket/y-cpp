@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "ycpp/base64.hpp"
+#include "base64_io.hpp"
 #include "ycpp/ycpp.hpp"
 
 namespace {
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
       saveDoc(path, *doc);
     } else if (cmd == "export") {
       auto doc = loadDoc(path);
-      std::cout << ycpp::base64::encode(doc->encodeStateAsUpdate()) << "\n";
+      std::cout << ycpp_tools::base64Encode(doc->encodeStateAsUpdate()) << "\n";
     } else if (cmd == "apply") {
       auto doc = loadDoc(path);
       std::string b64;
@@ -104,17 +104,17 @@ int main(int argc, char** argv) {
         ss << std::cin.rdbuf();
         b64 = ss.str();
       }
-      doc->applyUpdate(ycpp::base64::decode(b64));
+      doc->applyUpdate(ycpp_tools::base64Decode(b64));
       saveDoc(path, *doc);
       std::cout << doc->getText().toString() << "\n";
     } else if (cmd == "sv") {
       auto doc = loadDoc(path);
-      std::cout << ycpp::base64::encode(doc->encodeStateVector()) << "\n";
+      std::cout << ycpp_tools::base64Encode(doc->encodeStateVector()) << "\n";
     } else if (cmd == "diff") {
       if (argc < 4) { usage(); return 2; }
       auto doc = loadDoc(path);
-      std::cout << ycpp::base64::encode(
-                       doc->encodeStateAsUpdate(ycpp::base64::decode(argv[3])))
+      std::cout << ycpp_tools::base64Encode(
+                       doc->encodeStateAsUpdate(ycpp_tools::base64Decode(argv[3])))
                 << "\n";
     } else {
       usage();
