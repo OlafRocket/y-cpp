@@ -129,12 +129,26 @@ const makePeer = (name) => {
     })
     applying = false
   })
+  // Remote updates go through applyRemote(), which captures the caret as a
+  // Y.RelativePosition (anchored to content) and restores it afterwards, so
+  // edits applied before the caret don't make it drift.
+  let relSel = null
   ytext.observe(() => {
     if (applying) return
-    const pos = editor.selectionStart
     editor.value = ytext.toString()
-    editor.selectionStart = editor.selectionEnd = Math.min(pos, editor.value.length)
+    const absStart = relSel && Y.createAbsolutePositionFromRelativePosition(relSel[0], doc)
+    const absEnd = relSel && Y.createAbsolutePositionFromRelativePosition(relSel[1], doc)
+    editor.selectionStart = absStart ? absStart.index : editor.value.length
+    editor.selectionEnd = absEnd ? absEnd.index : editor.value.length
   })
+  const applyRemote = update => {
+    relSel = [
+      Y.createRelativePositionFromTypeIndex(ytext, editor.selectionStart),
+      Y.createRelativePositionFromTypeIndex(ytext, editor.selectionEnd)
+    ]
+    Y.applyUpdate(doc, update)
+    relSel = null
+  }
 
   el.addEventListener('click', e => {
     const act = e.target.dataset && e.target.dataset.act
@@ -149,7 +163,7 @@ const makePeer = (name) => {
         b64box.select()
         say('state vector exported — use with `ycpp diff <doc> <sv>`')
       } else if (act === 'apply') {
-        Y.applyUpdate(doc, b64decode(b64box.value))
+        applyRemote(b64decode(b64box.value))
         say('update applied ✓')
       }
     } catch (err) {
@@ -157,15 +171,15 @@ const makePeer = (name) => {
     }
   })
 
-  return { name, doc, ytext, say }
+  return { name, doc, ytext, say, applyRemote }
 }
 
 peers.push(makePeer('A'), makePeer('B'))
 
 document.getElementById('syncAB').addEventListener('click', () => {
   const [a, b] = peers
-  Y.applyUpdate(b.doc, Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(b.doc)))
-  Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(a.doc)))
+  b.applyRemote(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(b.doc)))
+  a.applyRemote(Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(a.doc)))
   a.say('synced ⇄'); b.say('synced ⇄')
 })
 </script>
