@@ -1,0 +1,8 @@
+{
+  "name": "ycpp-interop-tests",
+  "private": true,
+  "description": "Conformity tests: y-cpp against the reference yjs implementation",
+  "dependencies": {
+    "yjs": "^13.6.27"
+  }
+}

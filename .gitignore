@@ -67,3 +67,10 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# interop test deps
+tests/interop/node_modules/
+tests/interop/package-lock.json
+
+# ycpp doc files
+*.ydoc

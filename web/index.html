@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>y-cpp live test — Yjs interop</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #d8dce2; --text: #1c2128;
+    --muted: #59636e; --accent: #2f6feb; --mono: ui-monospace, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14181d; --panel: #1d232a; --border: #333b45; --text: #e6e9ec;
+            --muted: #9aa4af; --accent: #6ea8ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin-bottom: 1.25rem; }
+  .peers { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+           gap: 1rem; align-items: start; }
+  .peer { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 10px; padding: 1rem; }
+  .peer h2 { font-size: 1rem; margin: 0 0 .5rem; display: flex; justify-content: space-between; }
+  .peer h2 small { color: var(--muted); font-weight: normal; font-family: var(--mono); }
+  textarea.editor { width: 100%; height: 9rem; resize: vertical; border: 1px solid var(--border);
+             border-radius: 6px; padding: .5rem; font: 14px/1.4 var(--mono);
+             background: var(--bg); color: var(--text); }
+  textarea.b64 { width: 100%; height: 4.5rem; resize: vertical; border: 1px solid var(--border);
+             border-radius: 6px; padding: .4rem; font: 11px/1.35 var(--mono);
+             background: var(--bg); color: var(--muted); }
+  .row { display: flex; gap: .5rem; margin: .6rem 0 .3rem; flex-wrap: wrap; }
+  button { border: 1px solid var(--border); background: var(--panel); color: var(--text);
+           border-radius: 6px; padding: .35rem .7rem; cursor: pointer; font-size: .85rem; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(1.1); color: #fff; }
+  label { font-size: .78rem; color: var(--muted); display: block; margin-top: .6rem; }
+  .syncbar { text-align: center; margin: 1rem 0; }
+  .cli { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+         padding: 1rem 1.25rem; margin-top: 1.25rem; }
+  .cli pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+             padding: .7rem; overflow-x: auto; font: 12.5px/1.5 var(--mono); }
+  .status { font-size: .8rem; color: var(--muted); min-height: 1.2em; margin-top: .3rem; }
+  code { font-family: var(--mono); font-size: .85em; }
+</style>
+</head>
+<body>
+<h1>y-cpp live test</h1>
+<div class="sub">
+  Two real <a href="https://github.com/yjs/yjs">Yjs</a> peers running in this page.
+  Edit both sides, sync them, or exchange base64 updates with the <code>ycpp</code> C++ CLI —
+  all three speak the same Yjs v1 binary protocol.
+</div>
+
+<div class="peers" id="peers"></div>
+
+<div class="syncbar">
+  <button class="primary" id="syncAB">⇄ Sync A and B (state-vector diff exchange)</button>
+</div>
+
+<div class="cli">
+  <b>Testing against the C++ implementation</b>
+  <pre>
+# build once:  cmake -B build && cmake --build build
+./build/ycpp new /tmp/doc.ydoc
+./build/ycpp insert /tmp/doc.ydoc 0 "hello from C++"
+./build/ycpp export /tmp/doc.ydoc          # copy output → paste into a peer's "Apply update"
+./build/ycpp apply  /tmp/doc.ydoc BASE64   # BASE64 = a peer's "Export state" output
+./build/ycpp show   /tmp/doc.ydoc          # converged text</pre>
+  <div>Round-trip a doc through both worlds: the text ends up identical on every peer,
+       concurrent edits merge with the same YATA ordering everywhere.
+       The shared text lives in the Yjs root type <code>"default"</code>.</div>
+</div>
+
+<script type="module">
+import * as Y from 'https://cdn.jsdelivr.net/npm/yjs@13.6.27/+esm'
+
+const b64encode = u8 => {
+  let s = ''
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    s += String.fromCharCode(...u8.subarray(i, i + 0x8000))
+  }
+  return btoa(s)
+}
+const b64decode = str => Uint8Array.from(atob(str.trim()), c => c.charCodeAt(0))
+
+const peers = []
+
+const makePeer = (name) => {
+  const doc = new Y.Doc()
+  const ytext = doc.getText('default')
+
+  const el = document.createElement('div')
+  el.className = 'peer'
+  el.innerHTML = `
+    <h2>Peer ${name} <small>client ${doc.clientID}</small></h2>
+    <textarea class="editor" placeholder="type here…"></textarea>
+    <div class="row">
+      <button data-act="export">Export state</button>
+      <button data-act="sv">State vector</button>
+      <button data-act="apply">Apply update ⬇</button>
+    </div>
+    <label>base64 in/out (updates &amp; state vectors)</label>
+    <textarea class="b64" spellcheck="false"></textarea>
+    <div class="status"></div>`
+  document.getElementById('peers').appendChild(el)
+
+  const editor = el.querySelector('.editor')
+  const b64box = el.querySelector('.b64')
+  const status = el.querySelector('.status')
+  const say = msg => { status.textContent = msg }
+
+  // textarea <-> Y.Text binding (naive common-prefix/suffix diff)
+  let applying = false
+  editor.addEventListener('input', () => {
+    const oldVal = ytext.toString()
+    const newVal = editor.value
+    if (oldVal === newVal) return
+    let start = 0
+    while (start < oldVal.length && start < newVal.length && oldVal[start] === newVal[start]) start++
+    let endOld = oldVal.length, endNew = newVal.length
+    while (endOld > start && endNew > start && oldVal[endOld - 1] === newVal[endNew - 1]) { endOld--; endNew-- }
+    applying = true
+    doc.transact(() => {
+      if (endOld > start) ytext.delete(start, endOld - start)
+      if (endNew > start) ytext.insert(start, newVal.slice(start, endNew))
+    })
+    applying = false
+  })
+  ytext.observe(() => {
+    if (applying) return
+    const pos = editor.selectionStart
+    editor.value = ytext.toString()
+    editor.selectionStart = editor.selectionEnd = Math.min(pos, editor.value.length)
+  })
+
+  el.addEventListener('click', e => {
+    const act = e.target.dataset && e.target.dataset.act
+    if (!act) return
+    try {
+      if (act === 'export') {
+        b64box.value = b64encode(Y.encodeStateAsUpdate(doc))
+        b64box.select()
+        say('full state exported — paste into another peer or `ycpp apply`')
+      } else if (act === 'sv') {
+        b64box.value = b64encode(Y.encodeStateVector(doc))
+        b64box.select()
+        say('state vector exported — use with `ycpp diff <doc> <sv>`')
+      } else if (act === 'apply') {
+        Y.applyUpdate(doc, b64decode(b64box.value))
+        say('update applied ✓')
+      }
+    } catch (err) {
+      say('error: ' + err.message)
+    }
+  })
+
+  return { name, doc, ytext, say }
+}
+
+peers.push(makePeer('A'), makePeer('B'))
+
+document.getElementById('syncAB').addEventListener('click', () => {
+  const [a, b] = peers
+  Y.applyUpdate(b.doc, Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(b.doc)))
+  Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(a.doc)))
+  a.say('synced ⇄'); b.say('synced ⇄')
+})
+</script>
+</body>
+</html>
