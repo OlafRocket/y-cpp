@@ -3,6 +3,7 @@
   "private": true,
   "description": "Conformity tests: y-cpp against the reference yjs implementation",
   "dependencies": {
+    "ws": "^8.18.0",
     "yjs": "^13.6.27"
   }
 }

@@ -39,7 +39,8 @@ Tests:
 - `tests/test_main.cpp` — unit tests + multi-doc random-op convergence fuzzing
 - `tests/interop/` — **conformity suite**: exchanges real binary updates with
   the reference yjs implementation via Node (auto-`npm install`s yjs; skipped
-  if node is not found)
+  if node is not found), plus an end-to-end test of the `ycpp-sync` live
+  server with concurrent yjs peers over WebSocket
 
 ## CLI
 
@@ -59,27 +60,37 @@ can read them directly:
 
 The text lives in the Yjs root type `"default"`.
 
-## Live browser test
+## Live sync (WebSocket)
 
-`web/index.html` hosts two real Yjs peers with editable text areas. Serve it
-(CDN import of yjs, so any static server works):
-
-```sh
-python3 -m http.server -d web 8000
-# open http://localhost:8000
-```
-
-Edit both peers, hit *Sync*, and exchange base64 updates with the C++ side
-via copy/paste:
+`ycpp-sync` (built on [IXWebSocket](https://github.com/machinezone/IXWebSocket),
+fetched automatically by CMake; disable with `-DYCPP_BUILD_SYNC=OFF`) hosts a
+shared document behind an HTTP + WebSocket server — the CRDT logic stays
+entirely inside the ycpp library, the tool only moves update bytes:
 
 ```sh
-./build/ycpp new /tmp/doc.ydoc
-./build/ycpp apply /tmp/doc.ydoc BASE64   # paste a peer's "Export state"
-./build/ycpp insert /tmp/doc.ydoc 0 "from C++ "
-./build/ycpp export /tmp/doc.ydoc         # paste into a peer's "Apply update"
+./build/ycpp-sync serve                     # http://localhost:8765
 ```
 
-All three parties converge to the same text.
+- **Browsers**: open `http://localhost:8765/` (serves `web/live.html`, a real
+  Yjs peer) in any number of windows — every keystroke syncs live.
+- **Native peers**: `./build/ycpp-sync connect ws://localhost:8765` opens a
+  minimal terminal text box (POSIX terminals) editing the same text with its
+  own ycpp document. `serve` itself also opens the text box when run on a TTY;
+  use `--headless` on servers/Windows.
+- `--doc FILE` persists the document as a Yjs v1 update file (readable by
+  `ycpp` and by yjs itself).
+
+Protocol: on connect a peer receives the full state as one Yjs v1 update and
+offers its own; afterwards every binary WebSocket message is an incremental
+update relayed to all other peers. Updates are idempotent and commutative, so
+this trivial relay is a correct sync provider.
+
+## Manual browser test (no server)
+
+`web/index.html` hosts two Yjs peers with manual sync buttons and base64
+import/export boxes for copy/paste exchange with the `ycpp` CLI — useful for
+inspecting individual updates. Serve with any static server, e.g.
+`python3 -m http.server -d web 8000`.
 
 ## Library usage
 

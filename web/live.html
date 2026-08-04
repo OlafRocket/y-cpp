@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>y-cpp live sync</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #d8dce2; --text: #1c2128;
+    --muted: #59636e; --accent: #2f6feb; --ok: #2da44e; --bad: #cf222e;
+    --mono: ui-monospace, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14181d; --panel: #1d232a; --border: #333b45; --text: #e6e9ec;
+            --muted: #9aa4af; --accent: #6ea8ff; --ok: #4ac26b; --bad: #ff7b72; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin-inline: auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin-bottom: 1rem; }
+  .status { display: flex; gap: 1rem; align-items: center; font-size: .85rem;
+            color: var(--muted); margin-bottom: .75rem; font-family: var(--mono); }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; background: var(--bad);
+         display: inline-block; margin-right: .35rem; }
+  .dot.on { background: var(--ok); }
+  textarea { width: 100%; height: 60vh; resize: vertical; border: 1px solid var(--border);
+             border-radius: 10px; padding: 1rem; font: 15px/1.5 var(--mono);
+             background: var(--panel); color: var(--text); }
+  textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .hint { color: var(--muted); font-size: .8rem; margin-top: .75rem; }
+  code { font-family: var(--mono); font-size: .85em; }
+</style>
+</head>
+<body>
+<h1>y-cpp live sync</h1>
+<div class="sub">A real Yjs peer, synced over WebSocket with the <code>ycpp-sync</code> C++ server.
+  Open this page in several windows and run <code>ycpp-sync connect</code> in terminals — everyone edits the same text.</div>
+<div class="status">
+  <span><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
+  <span id="peer"></span>
+  <span id="len"></span>
+</div>
+<textarea id="editor" placeholder="type here — every keystroke syncs live" spellcheck="false"></textarea>
+<div class="hint">
+  Server: <code>./build/ycpp-sync serve</code> · native peer:
+  <code>./build/ycpp-sync connect ws://localhost:8765</code> ·
+  ws URL override: <code>?ws=ws://host:port</code>
+</div>
+
+<script type="module">
+import * as Y from 'https://cdn.jsdelivr.net/npm/yjs@13.6.27/+esm'
+
+const doc = new Y.Doc()
+const ytext = doc.getText('default')
+const editor = document.getElementById('editor')
+const dot = document.getElementById('dot')
+const conn = document.getElementById('conn')
+document.getElementById('peer').textContent = 'client ' + doc.clientID
+
+const params = new URLSearchParams(location.search)
+const wsUrl = params.get('ws') ||
+  (location.protocol.startsWith('http') ? `ws://${location.host}` : 'ws://localhost:8765')
+
+// --- textarea <-> Y.Text binding (common-prefix/suffix diff) ---
+let applying = false
+editor.addEventListener('input', () => {
+  const oldVal = ytext.toString()
+  const newVal = editor.value
+  if (oldVal === newVal) return
+  let start = 0
+  while (start < oldVal.length && start < newVal.length && oldVal[start] === newVal[start]) start++
+  let endOld = oldVal.length, endNew = newVal.length
+  while (endOld > start && endNew > start && oldVal[endOld - 1] === newVal[endNew - 1]) { endOld--; endNew-- }
+  applying = true
+  doc.transact(() => {
+    if (endOld > start) ytext.delete(start, endOld - start)
+    if (endNew > start) ytext.insert(start, newVal.slice(start, endNew))
+  })
+  applying = false
+})
+ytext.observe(() => {
+  document.getElementById('len').textContent = ytext.length + ' chars'
+  if (applying) return
+  const s = editor.selectionStart, e = editor.selectionEnd
+  editor.value = ytext.toString()
+  editor.selectionStart = Math.min(s, editor.value.length)
+  editor.selectionEnd = Math.min(e, editor.value.length)
+})
+
+// --- WebSocket transport: binary messages are Yjs v1 updates ---
+let ws = null
+const connect = () => {
+  ws = new WebSocket(wsUrl)
+  ws.binaryType = 'arraybuffer'
+  ws.onopen = () => {
+    dot.classList.add('on')
+    conn.textContent = wsUrl
+    // Offer our state (covers edits made while offline); the server sends its own.
+    ws.send(Y.encodeStateAsUpdate(doc))
+  }
+  ws.onmessage = e => Y.applyUpdate(doc, new Uint8Array(e.data), 'ws')
+  ws.onclose = () => {
+    dot.classList.remove('on')
+    conn.textContent = 'reconnecting…'
+    setTimeout(connect, 1500)
+  }
+  ws.onerror = () => ws.close()
+}
+doc.on('update', (update, origin) => {
+  if (origin !== 'ws' && ws && ws.readyState === WebSocket.OPEN) ws.send(update)
+})
+connect()
+</script>
+</body>
+</html>
