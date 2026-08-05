@@ -2,9 +2,10 @@
 
 A minimal C++ implementation of the [Yjs](https://github.com/yjs/yjs) CRDT
 protocol (v1 binary encoding), interoperable at the wire level with real Yjs
-peers. The current scope is **collaborative plain text**: multiple parties —
-browsers running yjs, Node processes, and native C++ programs — edit the same
-text concurrently and converge to the identical result.
+peers. It covers **collaborative plain text (Y.Text), sequences (Y.Array),
+and key-value maps (Y.Map)** — including nested combinations — so multiple
+parties (browsers running yjs, Node processes, native C++ programs) edit the
+same document concurrently and converge to the identical result.
 
 The minimal feature set and its rationale are described in
 [docs/MINIMAL_FEATURES.md](docs/MINIMAL_FEATURES.md). The code is a direct
@@ -14,8 +15,14 @@ lib0 v1 update codec); the Rust implementation
 
 ## What works
 
-- `Y.Text` on root types: insert / delete, UTF-16 indexing (JS semantics),
-  full unicode incl. surrogate pairs
+- `Y.Text`: insert / delete, UTF-16 indexing (JS semantics), full unicode
+  incl. surrogate pairs
+- `Y.Array` and `Y.Map` (since 0.3): JSON-ish values (lib0 "Any" encoding),
+  binary values, arbitrary nesting of arrays/maps/texts, cascade deletion of
+  nested types, `parentSub` map semantics with yjs-identical conflict winners
+- Legacy/unsupported content (`ContentJSON`, `ContentEmbed`, `ContentFormat`,
+  `ContentDoc`) is decoded, preserved, and re-encoded opaquely instead of
+  rejected
 - Yjs **v1 update** encode/decode: `applyUpdate`, `encodeStateAsUpdate`,
   `encodeStateVector`, state-vector–based diff sync
 - YATA conflict resolution — byte-for-byte the same ordering decisions as yjs
@@ -26,8 +33,9 @@ lib0 v1 update codec); the Rust implementation
 - Out-of-order update delivery (pending structs/deletes, retried and
   preserved across re-encodes)
 
-Out of scope for now: Y.Map/Y.Array/XML types, rich-text attributes, v2
-encoding, undo, awareness, transports. See the feature doc.
+Out of scope for now: XML types (decoded/preserved, no API), rich-text
+attributes, subdocuments, v2 encoding, undo, awareness, transports. See the
+feature doc.
 
 ## Build & test
 
@@ -102,8 +110,19 @@ inspecting individual updates. Serve with any static server, e.g.
 
 ycpp::Doc a, b;
 a.getText().insert(0, "hello");
+
+auto arr = a.getArray("list");
+arr.push(ycpp::Any::of(42));
+arr.push(ycpp::Any::of("hi"));
+
+auto meta = a.getMap("meta");
+meta.set("title", ycpp::Any::of("demo"));
+auto nested = meta.setMap("nested");     // nested shared types
+nested.set("deep", ycpp::Any::of(true));
+
 b.applyUpdate(a.encodeStateAsUpdate(b.encodeStateVector()));
 // b.getText().toString() == "hello"
+// b.toJson() == a.toJson()
 ```
 
 ## License

@@ -126,8 +126,9 @@ websocket transport are *not* part of the core and are out of scope.)
 ## 2. Explicitly out of scope (for now)
 
 - v2 update encoding (`applyUpdateV2`) — v1 is what yjs uses by default.
-- Y.Map / Y.Array / Y.XmlFragment / subdocuments (`parentSub`, `ContentType`).
-- Rich-text formatting attributes and embeds (`ContentFormat`, `ContentEmbed`).
+- Y.Xml* types and subdocuments: decoded and preserved on the wire, no API.
+- Rich-text formatting attributes and embeds (`ContentFormat`,
+  `ContentEmbed`): decoded and preserved on the wire, no API.
 - Undo manager, snapshots, relative positions.
 - Observers/events, transactions with origin tracking.
 - Awareness protocol and any network transport (sync is byte-array in/out;
@@ -135,12 +136,20 @@ websocket transport are *not* part of the core and are out of scope.)
 
 Implemented since 0.2 (was out of scope in 0.1):
 
-- Item merging and tombstone garbage collection: deleted string content is
-  replaced with `ContentDeleted` (yjs `Item.gc` with a live parent) and
-  adjacent mergeable items are compacted, mirroring yjs's transaction
-  cleanup. Tombstones themselves are kept — replacing whole structs with
-  `GC` only applies to deleted *parents*, which cannot occur with root-only
-  types.
+- Item merging and tombstone garbage collection: deleted droppable content
+  (string/any/binary) is replaced with `ContentDeleted` (yjs `Item.gc` with a
+  live parent) and adjacent mergeable items are compacted, mirroring yjs's
+  transaction cleanup. Tombstones themselves are kept — deleted nested types
+  keep their type ref and are not replaced with `GC` structs (equivalent to a
+  yjs doc with `gc: false` for type nodes); GC structs from peers are still
+  accepted.
+
+Implemented since 0.3 (was out of scope in 0.1):
+
+- Y.Array and Y.Map, on root and nested types: `ContentAny` (lib0 "Any"
+  values), `ContentBinary`, `ContentType` with `parentSub` map semantics
+  (key chains, last-writer-wins by YATA order), parents addressed by item ID,
+  and cascade deletion of nested subtrees (`ContentType.delete`).
 
 ## 3. Conformity test strategy
 

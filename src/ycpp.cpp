@@ -51,14 +51,25 @@ size_t findIndex(const std::vector<Item*>& v, uint64_t clock) {
   throw std::runtime_error("ycpp: struct not found in store");
 }
 
-// Drop the first `offset` UTF-16 units of an item's content (used when the
-// prefix of an incoming struct is already known).
+// Drop the first `offset` content units of an item (used when the prefix of
+// an incoming struct is already known).
 void spliceContentLeft(Item* it, uint64_t offset) {
-  if (it->kind == ContentKind::String) {
-    it->str.erase(0, offset);
-    if (!it->str.empty() && it->str[0] >= 0xDC00 && it->str[0] <= 0xDFFF) {
-      it->str[0] = 0xFFFD;  // split surrogate pair, same as yjs ContentString
-    }
+  switch (it->kind) {
+    case ContentKind::String:
+      it->str.erase(0, offset);
+      if (!it->str.empty() && it->str[0] >= 0xDC00 && it->str[0] <= 0xDFFF) {
+        it->str[0] = 0xFFFD;  // split surrogate pair, same as yjs ContentString
+      }
+      break;
+    case ContentKind::Any:
+    case ContentKind::JSON:
+      it->anyVals.erase(it->anyVals.begin(),
+                        it->anyVals.begin() + static_cast<long>(offset));
+      break;
+    case ContentKind::Deleted:
+      break;
+    default:
+      if (offset > 0) throw std::runtime_error("ycpp: cannot splice this content");
   }
   it->len -= offset;
 }
@@ -73,6 +84,28 @@ std::map<uint64_t, uint64_t> decodeStateVector(const std::vector<uint8_t>& bytes
     sv[client] = clock;
   }
   return sv;
+}
+
+// One content unit of an item as a Value.
+Value valueAt(const Item* it, uint64_t idx) {
+  Value v;
+  switch (it->kind) {
+    case ContentKind::Type: v.type = it->typeContent; break;
+    case ContentKind::Any:
+    case ContentKind::JSON:
+      v.any = it->anyVals[idx];
+      break;
+    case ContentKind::Embed:
+    case ContentKind::Doc:
+      v.any = it->anyVals.empty() ? Any() : it->anyVals[0];
+      break;
+    case ContentKind::Binary: v.any = Any::binary(it->bin); break;
+    case ContentKind::String:
+      v.any = Any::of(utf::utf16To8(it->str.substr(idx, 1)));
+      break;
+    default: break;
+  }
+  return v;
 }
 
 }  // namespace
@@ -98,21 +131,38 @@ Item* Doc::alloc() {
   return p;
 }
 
+YType* Doc::allocType(TypeKind kind) {
+  typeArena_.push_back(std::make_unique<YType>());
+  YType* t = typeArena_.back().get();
+  t->kind = kind;
+  t->doc = this;
+  return t;
+}
+
+YType* Doc::rootType(const std::string& name, TypeKind wanted) {
+  auto it = roots_.find(name);
+  if (it == roots_.end()) {
+    YType* t = allocType(wanted);
+    t->rootName = name;
+    roots_[name] = t;
+    return t;
+  }
+  YType* t = it->second;
+  if (t->kind == TypeKind::Unknown) t->kind = wanted;  // late typing of a decoded root
+  if (wanted != TypeKind::Unknown && t->kind != wanted) {
+    throw std::runtime_error("ycpp: root type '" + name + "' already has a different kind");
+  }
+  return t;
+}
+
+Text Doc::getText(const std::string& name) { return Text(rootType(name, TypeKind::Text)); }
+Array Doc::getArray(const std::string& name) { return Array(rootType(name, TypeKind::Array)); }
+Map Doc::getMap(const std::string& name) { return Map(rootType(name, TypeKind::Map)); }
+
 size_t Doc::structCount() const {
   size_t n = 0;
   for (const auto& [client, v] : store_) n += v.size();
   return n;
-}
-
-Text& Doc::getText(const std::string& name) {
-  auto it = types_.find(name);
-  if (it == types_.end()) {
-    auto t = std::make_unique<Text>();
-    t->name = name;
-    t->doc = this;
-    it = types_.emplace(name, std::move(t)).first;
-  }
-  return *it->second;
 }
 
 uint64_t Doc::getState(uint64_t client) const {
@@ -152,20 +202,36 @@ Item* Doc::splitItem(Item* it, uint64_t diff) {
   r->deleted = it->deleted;
   r->integrated = true;
   r->len = it->len - diff;
-  if (it->kind == ContentKind::String) {
-    r->str = it->str.substr(diff);
-    it->str.resize(diff);
-    // Splitting inside a surrogate pair produces two U+FFFD, same as yjs.
-    if (!it->str.empty() && it->str.back() >= 0xD800 && it->str.back() <= 0xDBFF) {
-      it->str.back() = 0xFFFD;
-      r->str[0] = 0xFFFD;
-    }
+  switch (it->kind) {
+    case ContentKind::String:
+      r->str = it->str.substr(diff);
+      it->str.resize(diff);
+      // Splitting inside a surrogate pair produces two U+FFFD, same as yjs.
+      if (!it->str.empty() && it->str.back() >= 0xD800 && it->str.back() <= 0xDBFF) {
+        it->str.back() = 0xFFFD;
+        r->str[0] = 0xFFFD;
+      }
+      break;
+    case ContentKind::Any:
+    case ContentKind::JSON:
+      r->anyVals.assign(it->anyVals.begin() + static_cast<long>(diff), it->anyVals.end());
+      it->anyVals.resize(diff);
+      break;
+    case ContentKind::Deleted:
+      break;
+    default:
+      throw std::runtime_error("ycpp: cannot split this content kind");
   }
   it->len = diff;
   r->right = it->right;
   if (r->right) r->right->left = r;
   it->right = r;
   r->left = it;
+  // The split right part may become the current map value holder.
+  if (r->parentSub && r->parent) {
+    auto mit = r->parent->map.find(*r->parentSub);
+    if (mit != r->parent->map.end() && mit->second == it) mit->second = r;
+  }
   auto& v = store_[it->id.client];
   v.insert(v.begin() + static_cast<long>(findIndex(v, it->id.clock)) + 1, r);
   return r;
@@ -189,17 +255,42 @@ Item* Doc::getItemCleanEnd(const ID& id) {
   return it;
 }
 
-void Doc::markDeleted(Item* s) {
+void Doc::deleteItem(Item* s) {
   if (s->deleted) return;
   s->deleted = true;
-  if (s->countable() && s->parent) s->parent->length -= s->len;
-  // Garbage-collect the content right away (yjs Item.gc with a live parent:
-  // content becomes ContentDeleted, keeping only the clock length). Sync needs
-  // the length, not the characters, and we have no observers reading them.
-  if (s->kind == ContentKind::String) {
-    s->kind = ContentKind::Deleted;
-    s->str.clear();
-    s->str.shrink_to_fit();
+  if (s->countable() && !s->parentSub && s->parent) s->parent->length -= s->len;
+  switch (s->kind) {
+    // Garbage-collect droppable content right away (yjs Item.gc with a live
+    // parent): only the clock length is needed for sync.
+    case ContentKind::String:
+      s->str.clear();
+      s->str.shrink_to_fit();
+      s->kind = ContentKind::Deleted;
+      break;
+    case ContentKind::Any:
+      s->anyVals.clear();
+      s->anyVals.shrink_to_fit();
+      s->kind = ContentKind::Deleted;
+      break;
+    case ContentKind::Binary:
+      s->bin.clear();
+      s->bin.shrink_to_fit();
+      s->kind = ContentKind::Deleted;
+      break;
+    case ContentKind::Type:
+      // ContentType.delete: the whole subtree dies with its container. The
+      // type ref itself is kept (we do not convert children to GC structs).
+      if (s->typeContent) {
+        for (Item* c = s->typeContent->start; c != nullptr; c = c->right) {
+          if (!c->deleted) deleteItem(c);
+        }
+        for (auto& [k, item] : s->typeContent->map) {
+          if (!item->deleted) deleteItem(item);
+        }
+      }
+      break;
+    default:
+      break;  // JSON/Embed/Format/Doc kept opaque
   }
 }
 
@@ -210,6 +301,13 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
   Item* l = v[pos - 1];
   Item* r = v[pos];
   if (l->kind != r->kind || l->deleted != r->deleted) return false;
+  switch (l->kind) {
+    case ContentKind::String: case ContentKind::Deleted: case ContentKind::GC:
+    case ContentKind::Any: case ContentKind::JSON:
+      break;
+    default:
+      return false;  // Binary/Type/Embed/Format/Doc do not merge
+  }
   if (l->id.clock + l->len != r->id.clock) return false;
   if (l->kind != ContentKind::GC) {
     if (l->right != r) return false;
@@ -217,10 +315,17 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
     if (!sameOpt(l->rightOrigin, r->rightOrigin)) return false;
   }
   if (l->kind == ContentKind::String) l->str += r->str;
+  if (l->kind == ContentKind::Any || l->kind == ContentKind::JSON) {
+    l->anyVals.insert(l->anyVals.end(), r->anyVals.begin(), r->anyVals.end());
+  }
   l->len += r->len;
   if (l->kind != ContentKind::GC) {
     l->right = r->right;
     if (r->right) r->right->left = l;
+  }
+  if (r->parentSub && r->parent) {
+    auto mit = r->parent->map.find(*r->parentSub);
+    if (mit != r->parent->map.end() && mit->second == r) mit->second = l;
   }
   v.erase(v.begin() + static_cast<long>(pos));
   items_.erase(r);
@@ -261,6 +366,9 @@ void Doc::integrateAsGc(Item* it, uint64_t offset) {
   it->kind = ContentKind::GC;
   it->deleted = true;
   it->str.clear();
+  it->anyVals.clear();
+  it->bin.clear();
+  it->typeContent = nullptr;
   it->left = it->right = nullptr;
   addStruct(it);
   auto& v = store_[it->id.client];
@@ -268,8 +376,8 @@ void Doc::integrateAsGc(Item* it, uint64_t offset) {
 }
 
 // Port of yjs Item.getMissing (neighbor/parent resolution) + Item.integrate
-// (YATA conflict resolution). `offset` > 0 means the first `offset` clock
-// units of this struct are already present in the store.
+// (YATA conflict resolution and map semantics). `offset` > 0 means the first
+// `offset` clock units of this struct are already present in the store.
 void Doc::integrate(Item* it, uint64_t offset) {
   if (it->kind == ContentKind::GC) {
     integrateAsGc(it, offset);
@@ -291,9 +399,16 @@ void Doc::integrate(Item* it, uint64_t offset) {
   // Resolve parent.
   if (!it->parent) {
     if (it->parentName) {
-      it->parent = &getText(*it->parentName);
+      it->parent = rootType(*it->parentName, TypeKind::Unknown);
     } else if (it->parentId) {
-      throw std::runtime_error("ycpp: non-root parent types are not supported (text-only build)");
+      Item* p = getItem(*it->parentId);
+      if (p->kind == ContentKind::Type && p->typeContent) {
+        it->parent = p->typeContent;
+      } else {
+        // Parent item was garbage-collected: integrate as GC (yjs getMissing).
+        integrateAsGc(it, offset);
+        return;
+      }
     } else if (it->left) {
       it->parent = it->left->parent;
       it->parentSub = it->left->parentSub;
@@ -306,9 +421,7 @@ void Doc::integrate(Item* it, uint64_t offset) {
     integrateAsGc(it, offset);
     return;
   }
-  if (it->parentSub) {
-    throw std::runtime_error("ycpp: parentSub (Y.Map keys) is not supported (text-only build)");
-  }
+  YType* parent = it->parent;
 
   if (offset > 0) {
     it->id.clock += offset;
@@ -326,7 +439,16 @@ void Doc::integrate(Item* it, uint64_t offset) {
   if ((!it->left && (!it->right || it->right->left != nullptr)) ||
       (it->left && it->left->right != it->right)) {
     Item* left = it->left;
-    Item* o = left ? left->right : it->parent->start;
+    Item* o;
+    if (left != nullptr) {
+      o = left->right;
+    } else if (it->parentSub) {
+      auto mit = parent->map.find(*it->parentSub);
+      o = mit == parent->map.end() ? nullptr : mit->second;
+      while (o != nullptr && o->left != nullptr) o = o->left;
+    } else {
+      o = parent->start;
+    }
     std::unordered_set<const Item*> conflictingItems;
     std::unordered_set<const Item*> itemsBeforeOrigin;
     while (o != nullptr && o != it->right) {
@@ -354,18 +476,39 @@ void Doc::integrate(Item* it, uint64_t offset) {
     it->left = left;
   }
 
-  // Reconnect the linked list.
+  // Reconnect the linked list / map chain.
   if (it->left) {
     it->right = it->left->right;
     it->left->right = it;
   } else {
-    it->right = it->parent->start;
-    it->parent->start = it;
+    Item* r;
+    if (it->parentSub) {
+      auto mit = parent->map.find(*it->parentSub);
+      r = mit == parent->map.end() ? nullptr : mit->second;
+      while (r != nullptr && r->left != nullptr) r = r->left;
+    } else {
+      r = parent->start;
+      parent->start = it;
+    }
+    it->right = r;
   }
-  if (it->right) it->right->left = it;
+  if (it->right) {
+    it->right->left = it;
+  } else if (it->parentSub) {
+    // This is the new current value for the map key; the previous one dies.
+    parent->map[*it->parentSub] = it;
+    if (it->left) deleteItem(it->left);
+  }
 
-  if (it->countable() && !it->deleted) it->parent->length += it->len;
+  if (!it->parentSub && it->countable() && !it->deleted) parent->length += it->len;
   addStruct(it);
+
+  // Delete if the parent container is deleted, or if this is a stale map value.
+  if ((parent->item != nullptr && parent->item->deleted) ||
+      (it->parentSub && it->right != nullptr)) {
+    deleteItem(it);
+  }
+
   // Compact: a run typed by one client collapses back into a single item.
   auto& v = store_[it->id.client];
   tryMergeWithLeft(v, v.size() - 1);
@@ -414,7 +557,7 @@ DeleteRange Doc::applyDeleteRange(uint64_t client, uint64_t clock, uint64_t len)
       if (s->id.clock >= applyEnd) break;
       if (!s->deleted) {
         if (applyEnd < s->id.clock + s->len) splitItem(s, applyEnd - s->id.clock);
-        markDeleted(s);
+        deleteItem(s);
       }
     }
     // Compact the freshly deleted run (and its boundaries) into merged tombstones.
@@ -469,15 +612,63 @@ void Doc::applyUpdate(const std::vector<uint8_t>& update) {
             it->deleted = true;
             it->len = dec.readVarUint();
             break;
+          case 2: {  // ContentJSON (legacy): kept as raw JSON strings
+            it->kind = ContentKind::JSON;
+            uint64_t n = dec.readVarUint();
+            for (uint64_t k = 0; k < n; k++) it->anyVals.push_back(Any::of(dec.readVarString()));
+            it->len = n;
+            break;
+          }
+          case 3:  // ContentBinary
+            it->kind = ContentKind::Binary;
+            it->bin = dec.readBytes(dec.readVarUint());
+            it->len = 1;
+            break;
           case 4:  // ContentString
             it->kind = ContentKind::String;
             it->str = utf::utf8To16(dec.readVarString());
             it->len = it->str.size();
             break;
+          case 5:  // ContentEmbed: raw JSON, opaque
+            it->kind = ContentKind::Embed;
+            it->anyVals.push_back(Any::of(dec.readVarString()));
+            it->len = 1;
+            break;
+          case 6:  // ContentFormat: attribute key + raw JSON value, opaque
+            it->kind = ContentKind::Format;
+            it->key = dec.readVarString();
+            it->anyVals.push_back(Any::of(dec.readVarString()));
+            it->len = 1;
+            break;
+          case 7: {  // ContentType
+            it->kind = ContentKind::Type;
+            uint64_t typeRef = dec.readVarUint();
+            if (typeRef > 6) {
+              throw std::runtime_error("ycpp: unknown type ref " + std::to_string(typeRef));
+            }
+            YType* t = allocType(static_cast<TypeKind>(typeRef));
+            if (typeRef == 3 || typeRef == 5) t->xmlName = dec.readVarString();
+            t->item = it;
+            it->typeContent = t;
+            it->len = 1;
+            break;
+          }
+          case 8: {  // ContentAny
+            it->kind = ContentKind::Any;
+            uint64_t n = dec.readVarUint();
+            it->anyVals.reserve(n);
+            for (uint64_t k = 0; k < n; k++) it->anyVals.push_back(anycodec::read(dec));
+            it->len = n;
+            break;
+          }
+          case 9:  // ContentDoc (subdocument): preserved, no subdoc semantics
+            it->kind = ContentKind::Doc;
+            it->key = dec.readVarString();  // guid
+            it->anyVals.push_back(anycodec::read(dec));
+            it->len = 1;
+            break;
           default:
-            throw std::runtime_error(
-                "ycpp: unsupported content ref " + std::to_string(ref) +
-                " (minimal build supports plain text only)");
+            throw std::runtime_error("ycpp: unsupported content ref " + std::to_string(ref));
         }
       }
       if (it->len == 0) continue;
@@ -531,8 +722,13 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
   if (it->rightOrigin) writeID(enc, *it->rightOrigin);
   if (!origin && !it->rightOrigin) {
     if (it->parent) {
-      enc.writeVarUint(1);
-      enc.writeVarString(it->parent->name);
+      if (it->parent->item != nullptr) {  // nested type: parent addressed by item id
+        enc.writeVarUint(0);
+        writeID(enc, it->parent->item->id);
+      } else {
+        enc.writeVarUint(1);
+        enc.writeVarString(it->parent->rootName);
+      }
     } else if (it->parentName) {
       enc.writeVarUint(1);
       enc.writeVarString(*it->parentName);
@@ -548,8 +744,42 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
     case ContentKind::Deleted:
       enc.writeVarUint(it->len - offset);
       break;
+    case ContentKind::JSON:
+      enc.writeVarUint(it->len - offset);
+      for (uint64_t i = offset; i < it->anyVals.size(); i++) {
+        enc.writeVarString(it->anyVals[i].str);
+      }
+      break;
+    case ContentKind::Binary:
+      enc.writeVarUint(it->bin.size());
+      enc.writeBytes(it->bin.data(), it->bin.size());
+      break;
     case ContentKind::String:
       enc.writeVarString(utf::utf16To8(it->str.substr(offset)));
+      break;
+    case ContentKind::Embed:
+      enc.writeVarString(it->anyVals[0].str);
+      break;
+    case ContentKind::Format:
+      enc.writeVarString(it->key);
+      enc.writeVarString(it->anyVals[0].str);
+      break;
+    case ContentKind::Type: {
+      TypeKind k = it->typeContent ? it->typeContent->kind : TypeKind::Unknown;
+      if (k == TypeKind::Unknown) throw std::runtime_error("ycpp: cannot encode untyped ContentType");
+      enc.writeVarUint(static_cast<uint8_t>(k));
+      if (k == TypeKind::XmlElement || k == TypeKind::XmlHook) {
+        enc.writeVarString(it->typeContent->xmlName);
+      }
+      break;
+    }
+    case ContentKind::Any:
+      enc.writeVarUint(it->len - offset);
+      for (uint64_t i = offset; i < it->anyVals.size(); i++) anycodec::write(enc, it->anyVals[i]);
+      break;
+    case ContentKind::Doc:
+      enc.writeVarString(it->key);
+      anycodec::write(enc, it->anyVals[0]);
       break;
     default:
       throw std::runtime_error("ycpp: cannot encode content kind");
@@ -697,6 +927,71 @@ std::vector<uint8_t> Doc::encodeStateVector() const {
   return enc.take();
 }
 
+// ------------------------------------------------------------ list/map ops
+
+Doc::ListPos Doc::findListPosition(YType* t, uint64_t index) {
+  ListPos pos;
+  pos.right = t->start;
+  uint64_t rem = index;
+  while (pos.right && rem > 0) {
+    if (!pos.right->deleted && pos.right->countable()) {
+      if (rem < pos.right->len) {
+        splitItem(pos.right, rem);
+        rem = 0;
+      } else {
+        rem -= pos.right->len;
+      }
+    }
+    pos.left = pos.right;
+    pos.right = pos.right->right;
+  }
+  return pos;
+}
+
+void Doc::listInsert(YType* t, uint64_t index, Item* it) {
+  if (index > t->length) throw std::out_of_range("ycpp: insert index out of range");
+  ListPos pos = findListPosition(t, index);
+  it->id = ID{clientId_, getState(clientId_)};
+  it->origin = pos.left ? std::optional<ID>(pos.left->lastId()) : std::nullopt;
+  it->rightOrigin = pos.right ? std::optional<ID>(pos.right->id) : std::nullopt;
+  it->left = pos.left;
+  it->right = pos.right;
+  it->parent = t;
+  integrate(it, 0);
+}
+
+void Doc::listRemove(YType* t, uint64_t index, uint64_t delLen) {
+  if (delLen == 0) return;
+  if (index + delLen > t->length) throw std::out_of_range("ycpp: remove range out of range");
+  ListPos pos = findListPosition(t, index);
+  Item* right = pos.right;
+  uint64_t remaining = delLen;
+  std::vector<ID> marked;
+  while (remaining > 0 && right) {
+    if (!right->deleted && right->countable()) {
+      if (remaining < right->len) splitItem(right, remaining);
+      deleteItem(right);
+      marked.push_back(right->id);
+      remaining -= right->len;
+    }
+    right = right->right;
+  }
+  // Compact after the walk (merging during it would invalidate the traversal).
+  for (const ID& id : marked) mergeAround(id.client, id.clock);
+}
+
+void Doc::mapSet(YType* t, const std::string& key, Item* it) {
+  auto mit = t->map.find(key);
+  Item* left = mit == t->map.end() ? nullptr : mit->second;
+  it->id = ID{clientId_, getState(clientId_)};
+  it->origin = left ? std::optional<ID>(left->lastId()) : std::nullopt;
+  it->left = left;
+  it->right = nullptr;
+  it->parent = t;
+  it->parentSub = key;
+  integrate(it, 0);
+}
+
 // ---------------------------------------------------------------------- Text
 
 void Text::insert(uint64_t index, const std::string& utf8) {
@@ -705,73 +1000,22 @@ void Text::insert(uint64_t index, const std::string& utf8) {
 
 void Text::insertUtf16(uint64_t index, const std::u16string& s) {
   if (s.empty()) return;
-  if (index > length) throw std::out_of_range("ycpp: insert index out of range");
-  Doc& d = *doc;
-  Item* left = nullptr;
-  Item* right = start;
-  uint64_t rem = index;
-  while (right && rem > 0) {
-    if (!right->deleted && right->countable()) {
-      if (rem < right->len) {
-        d.splitItem(right, rem);
-        rem = 0;
-      } else {
-        rem -= right->len;
-      }
-    }
-    left = right;
-    right = right->right;
-  }
-  Item* it = d.alloc();
-  it->id = ID{d.clientId(), d.getState(d.clientId())};
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
   it->kind = ContentKind::String;
   it->str = s;
   it->len = s.size();
-  it->origin = left ? std::optional<ID>(left->lastId()) : std::nullopt;
-  it->rightOrigin = right ? std::optional<ID>(right->id) : std::nullopt;
-  it->left = left;
-  it->right = right;
-  it->parent = this;
-  it->parentName = name;
-  d.integrate(it, 0);
+  d->listInsert(t_, index, it);
 }
 
 void Text::remove(uint64_t index, uint64_t delLen) {
-  if (delLen == 0) return;
-  if (index + delLen > length) throw std::out_of_range("ycpp: remove range out of range");
-  Doc& d = *doc;
-  Item* right = start;
-  uint64_t rem = index;
-  while (right && rem > 0) {
-    if (!right->deleted && right->countable()) {
-      if (rem < right->len) {
-        d.splitItem(right, rem);
-        rem = 0;
-      } else {
-        rem -= right->len;
-      }
-    }
-    right = right->right;
-  }
-  uint64_t remaining = delLen;
-  std::vector<ID> marked;
-  while (remaining > 0 && right) {
-    if (!right->deleted && right->countable()) {
-      if (remaining < right->len) d.splitItem(right, remaining);
-      d.markDeleted(right);
-      marked.push_back(right->id);
-      remaining -= right->len;
-    }
-    right = right->right;
-  }
-  // Compact after the walk (merging during it would invalidate the traversal).
-  for (const ID& id : marked) d.mergeAround(id.client, id.clock);
+  t_->doc->listRemove(t_, index, delLen);
 }
 
 std::u16string Text::toUtf16() const {
   std::u16string out;
-  out.reserve(length);
-  for (const Item* it = start; it != nullptr; it = it->right) {
+  out.reserve(t_->length);
+  for (const Item* it = t_->start; it != nullptr; it = it->right) {
     if (!it->deleted && it->kind == ContentKind::String) out += it->str;
   }
   return out;
@@ -779,6 +1023,214 @@ std::u16string Text::toUtf16() const {
 
 std::string Text::toString() const {
   return utf::utf16To8(toUtf16());
+}
+
+// --------------------------------------------------------------------- Array
+
+void Array::insert(uint64_t index, const std::vector<Any>& values) {
+  if (values.empty()) return;
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Any;
+  it->anyVals = values;
+  it->len = values.size();
+  d->listInsert(t_, index, it);
+}
+
+void Array::remove(uint64_t index, uint64_t delLen) {
+  t_->doc->listRemove(t_, index, delLen);
+}
+
+Value Array::get(uint64_t index) const {
+  for (const Item* it = t_->start; it != nullptr; it = it->right) {
+    if (it->deleted || !it->countable()) continue;
+    if (index < it->len) return valueAt(it, index);
+    index -= it->len;
+  }
+  throw std::out_of_range("ycpp: array index out of range");
+}
+
+Array Array::insertArray(uint64_t index) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Array);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->listInsert(t_, index, it);
+  return Array(it->typeContent);
+}
+
+Map Array::insertMap(uint64_t index) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Map);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->listInsert(t_, index, it);
+  return Map(it->typeContent);
+}
+
+Text Array::insertText(uint64_t index) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Text);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->listInsert(t_, index, it);
+  return Text(it->typeContent);
+}
+
+std::string Array::toJson() const {
+  std::string out;
+  t_->doc->dumpType(out, t_);
+  return out;
+}
+
+// ----------------------------------------------------------------------- Map
+
+void Map::set(const std::string& key, const Any& value) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Any;
+  it->anyVals = {value};
+  it->len = 1;
+  d->mapSet(t_, key, it);
+}
+
+void Map::remove(const std::string& key) {
+  auto mit = t_->map.find(key);
+  if (mit != t_->map.end() && !mit->second->deleted) t_->doc->deleteItem(mit->second);
+}
+
+bool Map::has(const std::string& key) const {
+  auto mit = t_->map.find(key);
+  return mit != t_->map.end() && !mit->second->deleted;
+}
+
+std::optional<Value> Map::get(const std::string& key) const {
+  auto mit = t_->map.find(key);
+  if (mit == t_->map.end() || mit->second->deleted) return std::nullopt;
+  const Item* it = mit->second;
+  return valueAt(it, it->len - 1);
+}
+
+std::vector<std::string> Map::keys() const {
+  std::vector<std::string> out;
+  for (const auto& [k, item] : t_->map) {
+    if (!item->deleted) out.push_back(k);
+  }
+  return out;
+}
+
+size_t Map::size() const { return keys().size(); }
+
+Array Map::setArray(const std::string& key) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Array);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->mapSet(t_, key, it);
+  return Array(it->typeContent);
+}
+
+Map Map::setMap(const std::string& key) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Map);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->mapSet(t_, key, it);
+  return Map(it->typeContent);
+}
+
+Text Map::setText(const std::string& key) {
+  Doc* d = t_->doc;
+  Item* it = d->alloc();
+  it->kind = ContentKind::Type;
+  it->typeContent = d->allocType(TypeKind::Text);
+  it->typeContent->item = it;
+  it->len = 1;
+  d->mapSet(t_, key, it);
+  return Text(it->typeContent);
+}
+
+std::string Map::toJson() const {
+  std::string out;
+  t_->doc->dumpType(out, t_);
+  return out;
+}
+
+// ---------------------------------------------------------------------- JSON
+
+void Doc::dumpType(std::string& out, const YType* t) const {
+  TypeKind kind = t->kind;
+  if (kind == TypeKind::Unknown) {
+    // Heuristic for roots never typed locally: map entries -> object,
+    // string-only list -> text, otherwise array.
+    bool hasMap = false;
+    for (const auto& [k, item] : t->map) {
+      if (!item->deleted) hasMap = true;
+    }
+    bool allString = true;
+    for (const Item* it = t->start; it != nullptr; it = it->right) {
+      if (!it->deleted && it->countable() && it->kind != ContentKind::String) allString = false;
+    }
+    kind = hasMap ? TypeKind::Map : (allString && t->start ? TypeKind::Text : TypeKind::Array);
+  }
+  if (kind == TypeKind::Text || kind == TypeKind::XmlText) {
+    json::escape(out, Text(const_cast<YType*>(t)).toString());
+    return;
+  }
+  if (kind == TypeKind::Map || kind == TypeKind::XmlHook) {
+    out.push_back('{');
+    bool first = true;
+    for (const auto& [k, item] : t->map) {
+      if (item->deleted) continue;
+      if (!first) out.push_back(',');
+      first = false;
+      json::escape(out, k);
+      out.push_back(':');
+      Value v = valueAt(item, item->len - 1);
+      if (v.isType()) dumpType(out, v.type);
+      else json::dump(out, v.any);
+    }
+    out.push_back('}');
+    return;
+  }
+  // Array-like (Array, XmlFragment, XmlElement children).
+  out.push_back('[');
+  bool first = true;
+  for (const Item* it = t->start; it != nullptr; it = it->right) {
+    if (it->deleted || !it->countable()) continue;
+    for (uint64_t i = 0; i < it->len; i++) {
+      if (!first) out.push_back(',');
+      first = false;
+      Value v = valueAt(it, i);
+      if (v.isType()) dumpType(out, v.type);
+      else json::dump(out, v.any);
+    }
+  }
+  out.push_back(']');
+}
+
+std::string Doc::toJson() const {
+  std::string out = "{";
+  bool first = true;
+  for (const auto& [name, t] : roots_) {
+    if (!first) out.push_back(',');
+    first = false;
+    json::escape(out, name);
+    out.push_back(':');
+    dumpType(out, t);
+  }
+  out.push_back('}');
+  return out;
 }
 
 }  // namespace ycpp

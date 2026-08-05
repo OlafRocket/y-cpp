@@ -45,6 +45,8 @@ class CppDoc {
     return Buffer.from(cli(['diff', this.file, Buffer.from(svBuf).toString('base64')], { env: this.env }), 'base64')
   }
   apply (updateBuf) { cli(['apply', this.file, Buffer.from(updateBuf).toString('base64')], { env: this.env }) }
+  json () { return JSON.parse(cli(['json', this.file], { env: this.env })) }
+  sample () { return JSON.parse(cli(['sample', this.file], { env: this.env })) }
 }
 
 const syncBoth = (ydoc, cppDoc) => {
@@ -206,6 +208,99 @@ test('random fuzz converges with yjs', () => {
     syncBoth(ydoc, cpp)
     checkEq(cpp.show(), t.toString(), `round ${round} converged`)
   }
+})
+
+// Deep equality with object keys normalized (cpp emits keys sorted, yjs in
+// insertion order — both are valid JSON object representations).
+const normalize = v => {
+  if (Array.isArray(v)) return v.map(normalize)
+  if (v && typeof v === 'object') {
+    const out = {}
+    for (const k of Object.keys(v).sort()) out[k] = normalize(v[k])
+    return out
+  }
+  return v
+}
+const deepEq = (a, b) => JSON.stringify(normalize(a)) === JSON.stringify(normalize(b))
+
+test('yjs map/array applied by ycpp', () => {
+  const ydoc = new Y.Doc()
+  const list = ydoc.getArray('list')
+  list.insert(0, [1, 'two', 3.5, true, null, { obj: [1, 2] }])
+  const meta = ydoc.getMap('meta')
+  meta.set('title', 'from yjs')
+  meta.set('gone', 'x')
+  meta.delete('gone')
+  const nested = new Y.Map()
+  meta.set('nested', nested)
+  nested.set('deep', -5)
+  const items = new Y.Array()
+  nested.set('items', items)
+  items.push(['a', 'b'])
+  const ytext = new Y.Text()
+  meta.set('note', ytext)
+  ytext.insert(0, 'nested text')
+
+  const cpp = new CppDoc(5000)
+  cpp.apply(Buffer.from(Y.encodeStateAsUpdate(ydoc)))
+  const j = cpp.json()
+  check(deepEq(j.list, list.toJSON()), 'array transferred')
+  check(deepEq(j.meta, meta.toJSON()), 'map with nesting transferred')
+})
+
+test('ycpp map/array applied by yjs', () => {
+  const cpp = new CppDoc(5001)
+  const expected = cpp.sample()
+  const ydoc = new Y.Doc()
+  Y.applyUpdate(ydoc, cpp.export())
+  check(deepEq(ydoc.getArray('list').toJSON(), expected.list), 'array read by yjs')
+  check(deepEq(ydoc.getMap('meta').toJSON(), expected.meta), 'nested map read by yjs')
+  check(ydoc.getText('prose').toString() === expected.prose, 'text read by yjs')
+})
+
+test('concurrent map sets converge across implementations', () => {
+  for (const cppId of [1, 0x7ffffff0]) {  // below and above yjs's random id
+    const ydoc = new Y.Doc()
+    const cpp = new CppDoc(cppId)
+    ydoc.getMap('m').set('k', 'init')
+    syncBoth(ydoc, cpp)
+    ydoc.getMap('m').set('k', 'from-yjs')
+    // cpp side sets the same key concurrently via a second cpp doc edit:
+    // build the edit through a sample-free path: apply a small update built here
+    const helper = new Y.Doc()
+    Y.applyUpdate(helper, cpp.export())
+    // Instead: cpp has no map-set CLI; simulate the concurrent edit from a
+    // separate yjs doc applied only to cpp, so cpp integrates it first.
+    helper.getMap('m').set('k', 'from-helper')
+    cpp.apply(Buffer.from(Y.encodeStateAsUpdate(helper, cpp.sv())))
+    syncBoth(ydoc, cpp)
+    syncBoth(ydoc, cpp)
+    check(deepEq(cpp.json().m, ydoc.getMap('m').toJSON()),
+          `map conflict converged (cpp id ${cppId})`)
+  }
+})
+
+test('yjs deletes nested type created by ycpp', () => {
+  const cpp = new CppDoc(5002)
+  cpp.sample()
+  const ydoc = new Y.Doc()
+  Y.applyUpdate(ydoc, cpp.export())
+  ydoc.getMap('meta').delete('nested')  // cascade-deletes cpp-created subtree
+  cpp.apply(Buffer.from(Y.encodeStateAsUpdate(ydoc, cpp.sv())))
+  check(cpp.json().meta.nested === undefined, 'cascade delete applied by cpp')
+  check(deepEq(cpp.json().meta, ydoc.getMap('meta').toJSON()), 'still converged')
+})
+
+test('binary values survive the cpp round-trip', () => {
+  const ydoc = new Y.Doc()
+  ydoc.getMap('m').set('bytes', new Uint8Array([0, 1, 2, 250, 255]))
+  const cpp = new CppDoc(5003)
+  cpp.apply(Buffer.from(Y.encodeStateAsUpdate(ydoc)))
+  const ydoc2 = new Y.Doc()
+  Y.applyUpdate(ydoc2, cpp.export())  // re-encoded by cpp
+  const back = ydoc2.getMap('m').get('bytes')
+  check(back instanceof Uint8Array && Buffer.from(back).equals(Buffer.from([0, 1, 2, 250, 255])),
+        'bytes identical after cpp re-encode')
 })
 
 test('ycpp doc file is a valid yjs update', () => {

@@ -119,7 +119,7 @@ TEST(base64_roundtrip) {
 
 TEST(text_insert_delete_local) {
   ycpp::Doc d(1);
-  auto& t = d.getText();
+  auto t = d.getText();
   t.insert(0, "hello world");
   t.insert(5, ",");
   checkEq(t.toString(), std::string("hello, world"), "insert middle");
@@ -129,14 +129,14 @@ TEST(text_insert_delete_local) {
   checkEq(t.toString(), std::string("hello world!"), "append");
   t.remove(0, 6);
   checkEq(t.toString(), std::string("world!"), "delete prefix");
-  checkEq(t.length, uint64_t(6), "length tracking");
+  checkEq(t.length(), uint64_t(6), "length tracking");
 }
 
 TEST(text_unicode_lengths) {
   ycpp::Doc d(1);
-  auto& t = d.getText();
+  auto t = d.getText();
   t.insert(0, "a\xF0\x9F\x98\x80z");  // a😀z — 4 UTF-16 units
-  checkEq(t.length, uint64_t(4), "UTF-16 length");
+  checkEq(t.length(), uint64_t(4), "UTF-16 length");
   t.remove(1, 2);  // delete the emoji (2 units)
   checkEq(t.toString(), std::string("az"), "delete emoji");
 }
@@ -281,16 +281,194 @@ TEST(sync_surrogate_split) {
   b.getText().insertUtf16(1, u"X");  // split the pair
   sync(a, b);
   checkEq(a.getText().toString(), b.getText().toString(), "converged after surrogate split");
-  checkEq(a.getText().length, uint64_t(3), "3 units");
+  checkEq(a.getText().length(), uint64_t(3), "3 units");
+}
+
+// ----------------------------------------------------------------- any codec
+
+TEST(any_codec_roundtrip) {
+  using ycpp::Any;
+  std::vector<Any> values = {
+      Any(), Any::null(), Any::of(true), Any::of(false),
+      Any::of(int64_t{0}), Any::of(int64_t{-1}), Any::of(int64_t{123456}),
+      Any::of(int64_t{0x7fffffff}), Any::of(int64_t{1} << 40),  // > 31 bits -> float64
+      Any::of(3.5), Any::of(-0.25), Any::of("héllo"),
+      Any::binary({1, 2, 255}),
+      Any::array({Any::of(int64_t{1}), Any::of("x")}),
+      Any::object({{"a", Any::of(int64_t{1})}, {"b", Any::array({Any::null()})}}),
+  };
+  for (const Any& v : values) {
+    ycpp::lib0::Encoder enc;
+    ycpp::anycodec::write(enc, v);
+    ycpp::lib0::Decoder dec(enc.bytes());
+    ycpp::Any back = ycpp::anycodec::read(dec);
+    if (v.kind == Any::Kind::Int && (v.integer > 0x7fffffff || v.integer < -0x7fffffff)) {
+      checkEq(back.number, static_cast<double>(v.integer), "large int as float64");
+    } else {
+      check(back == v, "any roundtrip");
+    }
+  }
+}
+
+TEST(lib0_varint_signed) {
+  for (int64_t v : {int64_t{0}, int64_t{1}, int64_t{-1}, int64_t{63}, int64_t{64},
+                    int64_t{-64}, int64_t{-65}, int64_t{1} << 30, -(int64_t{1} << 30)}) {
+    ycpp::lib0::Encoder enc;
+    enc.writeVarInt(v);
+    ycpp::lib0::Decoder dec(enc.bytes());
+    checkEq(dec.readVarInt(), v, "varInt roundtrip " + std::to_string(v));
+  }
+}
+
+// ----------------------------------------------------------------- array
+
+TEST(array_local_ops) {
+  ycpp::Doc d(1);
+  auto arr = d.getArray("a");
+  arr.insert(0, {ycpp::Any::of(int64_t{1}), ycpp::Any::of("two"), ycpp::Any::of(3.5)});
+  arr.push(ycpp::Any::of(true));
+  checkEq(arr.length(), uint64_t(4), "length");
+  checkEq(arr.get(1).any.str, std::string("two"), "get middle");
+  check(arr.get(3).any.boolean, "get pushed");
+  arr.remove(1, 2);
+  checkEq(arr.length(), uint64_t(2), "length after remove");
+  checkEq(arr.toJson(), std::string("[1,true]"), "json");
+  arr.insert(1, {ycpp::Any::of("mid")});
+  checkEq(arr.toJson(), std::string("[1,\"mid\",true]"), "insert middle");
+}
+
+TEST(array_sync_and_concurrent) {
+  ycpp::Doc a(1), b(2);
+  a.getArray("a").push(ycpp::Any::of(int64_t{1}));
+  sync(a, b);
+  a.getArray("a").push(ycpp::Any::of("from-a"));
+  b.getArray("a").push(ycpp::Any::of("from-b"));
+  sync(a, b);
+  checkEq(a.getArray("a").toJson(), b.getArray("a").toJson(), "converged");
+  checkEq(a.getArray("a").toJson(), std::string("[1,\"from-a\",\"from-b\"]"),
+          "lower client id first");
+}
+
+// ----------------------------------------------------------------- map
+
+TEST(map_local_ops) {
+  ycpp::Doc d(1);
+  auto m = d.getMap("m");
+  m.set("a", ycpp::Any::of(int64_t{1}));
+  m.set("b", ycpp::Any::of("x"));
+  checkEq(m.size(), size_t(2), "size");
+  check(m.has("a") && m.has("b") && !m.has("c"), "has");
+  checkEq(m.get("b")->any.str, std::string("x"), "get");
+  m.set("a", ycpp::Any::of(int64_t{2}));  // overwrite
+  checkEq(m.get("a")->any.integer, int64_t{2}, "overwrite");
+  m.remove("b");
+  check(!m.has("b"), "removed");
+  checkEq(m.toJson(), std::string("{\"a\":2}"), "json");
+}
+
+TEST(map_concurrent_set_same_key) {
+  // Concurrent sets of the same key: higher client id wins, both converge.
+  ycpp::Doc a(1), b(2);
+  a.getMap("m").set("k", ycpp::Any::of("init"));
+  sync(a, b);
+  a.getMap("m").set("k", ycpp::Any::of("from-a"));
+  b.getMap("m").set("k", ycpp::Any::of("from-b"));
+  sync(a, b);
+  checkEq(a.getMap("m").toJson(), b.getMap("m").toJson(), "converged");
+  checkEq(a.getMap("m").get("k")->any.str, std::string("from-b"), "higher client wins");
+}
+
+TEST(map_update_roundtrip) {
+  ycpp::Doc a(1);
+  auto m = a.getMap("m");
+  m.set("x", ycpp::Any::of(int64_t{7}));
+  m.set("gone", ycpp::Any::of("bye"));
+  m.remove("gone");
+  ycpp::Doc b(2);
+  b.applyUpdate(a.encodeStateAsUpdate());
+  checkEq(b.getMap("m").toJson(), a.getMap("m").toJson(), "map roundtrip");
+  check(!b.getMap("m").has("gone"), "tombstoned key stays gone");
+}
+
+// ----------------------------------------------------------------- nesting
+
+TEST(nested_types_sync) {
+  ycpp::Doc a(1), b(2);
+  auto m = a.getMap("root");
+  auto sub = m.setMap("sub");
+  sub.set("deep", ycpp::Any::of(int64_t{-5}));
+  auto items = sub.setArray("items");
+  items.push(ycpp::Any::of("a"));
+  auto note = m.setText("note");
+  note.insert(0, "nested text");
+  sync(a, b);
+  checkEq(b.getMap("root").toJson(), a.getMap("root").toJson(), "nested roundtrip");
+  // Edit the nested types on b, sync back.
+  auto bsub = b.getMap("root").get("sub")->type;
+  ycpp::Map(bsub).set("added", ycpp::Any::of(true));
+  auto bnote = b.getMap("root").get("note")->type;
+  ycpp::Text(bnote).insert(0, "more ");
+  sync(a, b);
+  checkEq(a.getMap("root").toJson(), b.getMap("root").toJson(), "nested edits converge");
+  check(a.getMap("root").toJson().find("more nested text") != std::string::npos,
+        "nested text edit visible");
+}
+
+TEST(nested_delete_cascade) {
+  ycpp::Doc a(1), b(2);
+  auto m = a.getMap("root");
+  auto sub = m.setMap("sub");
+  sub.set("x", ycpp::Any::of(int64_t{1}));
+  auto arr = sub.setArray("arr");
+  arr.push(ycpp::Any::of("payload"));
+  sync(a, b);
+  a.getMap("root").remove("sub");  // kills the whole subtree
+  sync(a, b);
+  check(!a.getMap("root").has("sub"), "subtree gone on a");
+  check(!b.getMap("root").has("sub"), "subtree gone on b");
+  checkEq(a.getMap("root").toJson(), std::string("{}"), "empty root");
+  // Concurrent edit into a deleted subtree must not resurrect it.
+  ycpp::Doc c(3);
+  c.applyUpdate(a.encodeStateAsUpdate());
+  checkEq(c.getMap("root").toJson(), std::string("{}"), "fresh load empty");
+}
+
+TEST(map_fuzz_converges) {
+  std::mt19937 rng(777);
+  const char* keys[] = {"a", "b", "c", "d"};
+  for (int round = 0; round < 10; round++) {
+    ycpp::Doc d0(100), d1(200), d2(300);
+    ycpp::Doc* docs[3] = {&d0, &d1, &d2};
+    for (int step = 0; step < 40; step++) {
+      ycpp::Doc& d = *docs[rng() % 3];
+      auto m = d.getMap("m");
+      uint32_t action = rng() % 10;
+      if (action < 6) {
+        m.set(keys[rng() % 4], ycpp::Any::of(static_cast<int64_t>(rng() % 1000)));
+      } else if (action < 8) {
+        m.remove(keys[rng() % 4]);
+      } else {
+        sync(*docs[rng() % 3], *docs[rng() % 3]);
+      }
+    }
+    for (int i = 0; i < 3; i++) {
+      sync(d0, d1);
+      sync(d1, d2);
+      sync(d0, d2);
+    }
+    std::string j = d0.getMap("m").toJson();
+    check(j == d1.getMap("m").toJson() && j == d2.getMap("m").toJson(),
+          "map fuzz round " + std::to_string(round) + " converged");
+  }
 }
 
 // ----------------------------------------------------------- compaction
 
 TEST(compaction_sequential_typing) {
   ycpp::Doc d(1);
-  auto& t = d.getText();
-  for (int i = 0; i < 50; i++) t.insert(t.length, "x");
-  checkEq(t.length, uint64_t(50), "all chars present");
+  auto t = d.getText();
+  for (int i = 0; i < 50; i++) t.insert(t.length(), "x");
+  checkEq(t.length(), uint64_t(50), "all chars present");
   checkEq(d.structCount(), size_t(1), "typed run merged into one struct");
   ycpp::Doc b(2);
   b.applyUpdate(d.encodeStateAsUpdate());
@@ -300,7 +478,7 @@ TEST(compaction_sequential_typing) {
 
 TEST(compaction_tombstones_and_gc) {
   ycpp::Doc d(1);
-  auto& t = d.getText();
+  auto t = d.getText();
   t.insert(0, std::string(500, 'a'));
   t.remove(0, 500);
   checkEq(t.toString(), std::string(""), "text empty");
@@ -314,7 +492,7 @@ TEST(compaction_tombstones_and_gc) {
 
 TEST(compaction_delete_char_by_char) {
   ycpp::Doc d(1);
-  auto& t = d.getText();
+  auto t = d.getText();
   t.insert(0, "abcdefghij");
   for (int i = 0; i < 10; i++) t.remove(0, 1);
   checkEq(t.toString(), std::string(""), "all deleted");
@@ -326,7 +504,7 @@ TEST(compaction_preserves_convergence) {
   // origins exactly (merge conditions guarantee it) — sync both ways.
   ycpp::Doc a(1), b(2);
   for (int i = 0; i < 5; i++) {
-    a.getText().insert(a.getText().length, std::string(1, static_cast<char>('a' + i)));
+    a.getText().insert(a.getText().length(), std::string(1, static_cast<char>('a' + i)));
   }
   checkEq(a.structCount(), size_t(1), "run merged on a");
   sync(a, b);
@@ -347,14 +525,14 @@ TEST(fuzz_random_ops_converge) {
     ycpp::Doc* docs[3] = {&d0, &d1, &d2};
     for (int step = 0; step < 60; step++) {
       ycpp::Doc& d = *docs[rng() % 3];
-      auto& t = d.getText();
+      auto t = d.getText();
       uint32_t action = rng() % 10;
       if (action < 6) {
-        uint64_t idx = t.length ? rng() % (t.length + 1) : 0;
+        uint64_t idx = t.length() ? rng() % (t.length() + 1) : 0;
         t.insert(idx, words[rng() % 8]);
-      } else if (action < 8 && t.length > 0) {
-        uint64_t idx = rng() % t.length;
-        uint64_t len = 1 + rng() % std::min<uint64_t>(t.length - idx, 4);
+      } else if (action < 8 && t.length() > 0) {
+        uint64_t idx = rng() % t.length();
+        uint64_t len = 1 + rng() % std::min<uint64_t>(t.length() - idx, 4);
         t.remove(idx, len);
       } else {
         sync(*docs[rng() % 3], *docs[rng() % 3]);
@@ -380,11 +558,11 @@ TEST(fuzz_update_reload_stability) {
   ycpp::Doc a(1), b(2);
   for (int step = 0; step < 100; step++) {
     ycpp::Doc& d = step % 2 ? a : b;
-    auto& t = d.getText();
-    if (rng() % 3 && t.length > 0) {
-      t.remove(rng() % t.length, 1);
+    auto t = d.getText();
+    if (rng() % 3 && t.length() > 0) {
+      t.remove(rng() % t.length(), 1);
     } else {
-      t.insert(t.length ? rng() % (t.length + 1) : 0, "ab");
+      t.insert(t.length() ? rng() % (t.length() + 1) : 0, "ab");
     }
     if (step % 7 == 0) sync(a, b);
   }

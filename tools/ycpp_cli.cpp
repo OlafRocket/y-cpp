@@ -27,6 +27,8 @@ void usage() {
       "  apply  <doc> [base64]         apply a base64 update (arg or stdin)\n"
       "  sv     <doc>                  print base64 state vector\n"
       "  diff   <doc> <base64-sv>      print base64 update relative to a state vector\n"
+      "  json   <doc>                  dump all root types (text/array/map) as JSON\n"
+      "  sample <doc>                  build a sample doc with array/map/nested types\n"
       "\n"
       "Doc files are raw Yjs v1 updates; the text lives in the root type \"default\".\n"
       "Set YCPP_CLIENT_ID to fix the client id (useful for tests).\n";
@@ -116,6 +118,33 @@ int main(int argc, char** argv) {
       std::cout << ycpp_tools::base64Encode(
                        doc->encodeStateAsUpdate(ycpp_tools::base64Decode(argv[3])))
                 << "\n";
+    } else if (cmd == "json") {
+      auto doc = loadDoc(path);
+      std::cout << doc->toJson() << "\n";
+    } else if (cmd == "sample") {
+      // Builds a known structure exercising array/map/nesting (used by the
+      // interop conformity tests, and as an API example).
+      auto doc = loadDoc(path);
+      auto arr = doc->getArray("list");
+      arr.insert(0, {ycpp::Any::of(int64_t{1}), ycpp::Any::of("two"),
+                     ycpp::Any::of(3.5), ycpp::Any::of(true), ycpp::Any::null()});
+      arr.push(ycpp::Any::array({ycpp::Any::of(int64_t{7}), ycpp::Any::of("eight")}));
+      arr.push(ycpp::Any::object({{"k", ycpp::Any::of("v")}}));
+      auto meta = doc->getMap("meta");
+      meta.set("title", ycpp::Any::of("sample"));
+      meta.set("count", ycpp::Any::of(int64_t{42}));
+      meta.set("gone", ycpp::Any::of("bye"));
+      meta.remove("gone");
+      auto nestedMap = meta.setMap("nested");
+      nestedMap.set("deep", ycpp::Any::of(int64_t{-5}));
+      auto nestedArr = nestedMap.setArray("items");
+      nestedArr.push(ycpp::Any::of("a"));
+      nestedArr.push(ycpp::Any::of("b"));
+      auto nestedText = meta.setText("note");
+      nestedText.insert(0, "hello nested text");
+      doc->getText("prose").insert(0, "top-level text");
+      saveDoc(path, *doc);
+      std::cout << doc->toJson() << "\n";
     } else {
       usage();
       return 2;

@@ -184,8 +184,8 @@ class Editor {
     std::vector<uint8_t> diff;
     {
       std::lock_guard<std::mutex> lk(sd_.mu);
-      auto& t = sd_.doc.getText();
-      if (cursor_ > t.length) cursor_ = t.length;
+      auto t = sd_.doc.getText();
+      if (cursor_ > t.length()) cursor_ = t.length();
       auto sv = sd_.doc.encodeStateVector();
       t.insertUtf16(cursor_, s);
       cursor_ += s.size();
@@ -199,8 +199,8 @@ class Editor {
     std::vector<uint8_t> diff;
     {
       std::lock_guard<std::mutex> lk(sd_.mu);
-      auto& t = sd_.doc.getText();
-      if (to > t.length || from >= to) return;
+      auto t = sd_.doc.getText();
+      if (to > t.length() || from >= to) return;
       auto sv = sd_.doc.encodeStateVector();
       t.remove(from, to - from);
       cursor_ = from;
@@ -554,7 +554,7 @@ int runServe(const Options& opts) {
     size_t peers = server.getClients().size();
     std::lock_guard<std::mutex> lk(sd.mu);
     return std::to_string(peers) + " peer(s), " +
-           std::to_string(sd.doc.getText().length) + " chars";
+           std::to_string(sd.doc.getText().length()) + " chars";
   };
 
   if (opts.headless) {
@@ -620,7 +620,7 @@ int runConnect(const Options& opts) {
   auto status = [&connected, &sd]() {
     std::string s = connected ? "connected" : "connecting...";
     std::lock_guard<std::mutex> lk(sd.mu);
-    return s + ", " + std::to_string(sd.doc.getText().length) + " chars";
+    return s + ", " + std::to_string(sd.doc.getText().length()) + " chars";
   };
 
   if (opts.headless) {
