@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(ycpp VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # editor tooling (IntelliSense/clangd)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
