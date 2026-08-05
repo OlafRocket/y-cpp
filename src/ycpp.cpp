@@ -1,6 +1,7 @@
 #include "ycpp/ycpp.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <random>
 #include <stdexcept>
 #include <unordered_set>
@@ -165,6 +166,81 @@ size_t Doc::structCount() const {
   return n;
 }
 
+void Doc::validate() const {
+  auto fail = [](const std::string& msg) {
+    throw std::logic_error("ycpp validate: " + msg);
+  };
+  auto inArena = [&](const Item* it) {
+    return items_.find(const_cast<Item*>(it)) != items_.end();
+  };
+
+  // Store: contiguous per-client clock ranges, every item arena-owned.
+  size_t referenced = 0;
+  for (const auto& [client, v] : store_) {
+    if (v.empty()) fail("empty store vector for client");
+    uint64_t clock = 0;
+    for (const Item* it : v) {
+      if (!inArena(it)) fail("store item not owned by arena");
+      if (it->id.client != client) fail("store item client mismatch");
+      if (it->id.clock != clock) fail("clock gap in store");
+      if (it->len == 0) fail("zero-length item in store");
+      if (!it->integrated) fail("store item not marked integrated");
+      if (it->deleted &&
+          (it->kind == ContentKind::String || it->kind == ContentKind::Any ||
+           it->kind == ContentKind::Binary)) {
+        fail("deleted item content not garbage-collected");
+      }
+      if (!it->deleted && it->kind == ContentKind::String && it->len != it->str.size()) {
+        fail("string item length mismatch");
+      }
+      if (!it->deleted && it->kind == ContentKind::Any && it->len != it->anyVals.size()) {
+        fail("any item length mismatch");
+      }
+      clock = it->id.clock + it->len;
+      referenced++;
+    }
+  }
+
+  // Pending: arena-owned, never integrated.
+  for (const auto& [client, q] : pending_) {
+    if (q.empty()) fail("empty pending queue kept alive");
+    for (const Item* it : q) {
+      if (!inArena(it)) fail("pending item not owned by arena");
+      if (it->integrated) fail("pending item marked integrated");
+      referenced++;
+    }
+  }
+  if (referenced != items_.size()) {
+    fail("arena orphans: " + std::to_string(items_.size()) + " owned vs " +
+         std::to_string(referenced) + " referenced");
+  }
+
+  // Types: list symmetry, parent links, length accounting, map chains.
+  for (const auto& tptr : typeArena_) {
+    const YType* t = tptr.get();
+    uint64_t countable = 0;
+    const Item* prev = nullptr;
+    for (const Item* n = t->start; n != nullptr; n = n->right) {
+      if (!inArena(n)) fail("list node not owned by arena");
+      if (n->left != prev) fail("list left/right asymmetry");
+      if (n->parent != t) fail("list node parent mismatch");
+      if (n->parentSub) fail("map item linked into list chain");
+      if (!n->deleted && n->countable()) countable += n->len;
+      prev = n;
+    }
+    if (countable != t->length) fail("type length mismatch");
+    for (const auto& [key, val] : t->map) {
+      if (val->right != nullptr) fail("map value is not the rightmost item");
+      for (const Item* n = val; n != nullptr; n = n->left) {
+        if (!inArena(n)) fail("map chain node not owned by arena");
+        if (!n->parentSub || *n->parentSub != key) fail("map chain key mismatch");
+        if (n->parent != t) fail("map chain parent mismatch");
+        if (n->left != nullptr && n->left->right != n) fail("map chain asymmetry");
+      }
+    }
+  }
+}
+
 uint64_t Doc::getState(uint64_t client) const {
   auto it = store_.find(client);
   if (it == store_.end() || it->second.empty()) return 0;
@@ -309,9 +385,11 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
     if (mit != r->parent->map.end() && mit->second == r) mit->second = l;
   }
   v.erase(v.begin() + static_cast<long>(pos));
-  items_.erase(r);
+  releaseItem(r);
   return true;
 }
+
+void Doc::releaseItem(Item* it) { items_.erase(it); }
 
 // ---------------------------------------------------------------- integration
 
@@ -492,6 +570,7 @@ void Doc::integrateLoop() {
         uint64_t state = getState(client);
         if (s->id.clock + s->len <= state) {  // fully known already
           q.pop_front();
+          releaseItem(s);
           progress = true;
           continue;
         }
@@ -545,7 +624,8 @@ void Doc::applyUpdate(const std::vector<uint8_t>& update, const std::string& ori
     uint64_t numStructs = dec.readVarUint();
     uint64_t client = dec.readVarUint();
     uint64_t clock = dec.readVarUint();
-    auto& q = pending_[client];
+    std::deque<Item*> incoming;
+    try {
     for (uint64_t i = 0; i < numStructs; i++) {
       uint8_t info = dec.readUint8();
       uint8_t ref = info & kBitsContent;
@@ -555,6 +635,7 @@ void Doc::applyUpdate(const std::vector<uint8_t>& update, const std::string& ori
       }
       Item* it = alloc();
       it->id = ID{client, clock};
+      try {
       if (ref == 0) {  // GC
         it->kind = ContentKind::GC;
         it->deleted = true;
@@ -635,12 +716,27 @@ void Doc::applyUpdate(const std::vector<uint8_t>& update, const std::string& ori
             throw std::runtime_error("ycpp: unsupported content ref " + std::to_string(ref));
         }
       }
-      if (it->len == 0) continue;
+      } catch (...) {
+        releaseItem(it);  // do not leave a half-decoded orphan in the arena
+        throw;
+      }
+      if (it->len == 0) {
+        releaseItem(it);
+        continue;
+      }
       clock += it->len;
-      q.push_back(it);
+      incoming.push_back(it);
     }
-    std::stable_sort(q.begin(), q.end(),
-                     [](const Item* a, const Item* b) { return a->id.clock < b->id.clock; });
+    } catch (...) {
+      for (Item* x : incoming) releaseItem(x);  // no orphans on bad updates
+      throw;
+    }
+    if (!incoming.empty()) {
+      auto& q = pending_[client];
+      q.insert(q.end(), incoming.begin(), incoming.end());
+      std::stable_sort(q.begin(), q.end(),
+                       [](const Item* a, const Item* b) { return a->id.clock < b->id.clock; });
+    }
   }
 
   integrateLoop();
@@ -1167,6 +1263,8 @@ void Doc::cleanupTransaction(Transaction& tx) {
     auto handlers = updateHandlers_;  // copy: callbacks may offUpdate
     for (const auto& [handle, fn] : handlers) fn(update, tx.origin);
   }
+
+  if (validateAfterTx_ && std::uncaught_exceptions() == 0) validate();
 }
 
 uint64_t Doc::onUpdate(UpdateHandler fn) {

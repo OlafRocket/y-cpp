@@ -297,6 +297,16 @@ class Doc {
   // Number of structs in the store (bounded by document shape, not history).
   size_t structCount() const;
 
+  // Walks every structure and throws std::logic_error if any internal
+  // invariant is broken (list symmetry, store contiguity, arena membership,
+  // type lengths, map-chain coherence, no orphaned items). Cheap insurance
+  // for tests; see setValidateAfterTransactions().
+  void validate() const;
+
+  // When enabled (test builds), validate() runs after every transaction, so
+  // a broken invariant fails at the mutation that caused it.
+  static void setValidateAfterTransactions(bool on) { validateAfterTx_ = on; }
+
   // JSON dump of every root type (sorted by name), for inspection/testing.
   std::string toJson() const;
 
@@ -340,6 +350,11 @@ class Doc {
   Item* getItemCleanEnd(const ID& id);
   Item* splitItem(Item* it, uint64_t diff);
   void deleteItem(Item* s);  // tombstone + record in tx + cascade types
+  // The single place an Item is freed. Checklist — every structure that may
+  // hold an Item*, all of which the caller must have unlinked first:
+  //   (1) neighbor left/right links, (2) the per-client store_ vector,
+  //   (3) YType::map values, (4) YType::start, (5) pending_ queues.
+  void releaseItem(Item* it);
   // Merges v[pos] into v[pos-1] if the yjs merge conditions hold (frees v[pos]).
   bool tryMergeWithLeft(std::vector<Item*>& v, size_t pos);
 
@@ -389,6 +404,8 @@ class Doc {
   std::vector<std::pair<uint64_t, UpdateHandler>> updateHandlers_;
   // Liveness token for Subscriptions: expires with the Doc.
   std::shared_ptr<void> aliveToken_ = std::make_shared<int>(0);
+
+  inline static bool validateAfterTx_ = false;
 };
 
 }  // namespace ycpp

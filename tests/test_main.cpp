@@ -788,6 +788,9 @@ TEST(fuzz_update_reload_stability) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Every transaction in every test re-validates all structural invariants
+  // (list symmetry, store contiguity, arena ownership, no orphans).
+  ycpp::Doc::setValidateAfterTransactions(true);
   std::string filter = argc > 1 ? argv[1] : "";
   int run = 0;
   for (auto& t : tests()) {
