@@ -143,6 +143,40 @@ class Text;
 class Array;
 class Map;
 
+// RAII observer registration: detaches automatically when destroyed (like
+// boost::signals2::scoped_connection). Movable, not copyable. Must not
+// outlive the Doc it was created from.
+class Subscription {
+ public:
+  Subscription() = default;
+  Subscription(const Subscription&) = delete;
+  Subscription& operator=(const Subscription&) = delete;
+  Subscription(Subscription&& o) noexcept { *this = std::move(o); }
+  Subscription& operator=(Subscription&& o) noexcept {
+    if (this != &o) {
+      reset();
+      type_ = o.type_;
+      doc_ = o.doc_;
+      handle_ = o.handle_;
+      o.type_ = nullptr;
+      o.doc_ = nullptr;
+      o.handle_ = 0;
+    }
+    return *this;
+  }
+  ~Subscription() { reset(); }
+
+  void reset();  // detach now (idempotent)
+  bool active() const { return handle_ != 0; }
+
+ private:
+  friend class TypeRef;
+  friend class Doc;
+  YType* type_ = nullptr;  // set for type observers
+  Doc* doc_ = nullptr;     // set for doc update handlers
+  uint64_t handle_ = 0;
+};
+
 // ------------------------------------------------------------------ wrappers
 
 class TypeRef {
@@ -155,6 +189,10 @@ class TypeRef {
   // (local edits and applyUpdate alike). Returns a handle for unobserve().
   uint64_t observe(Observer fn);
   void unobserve(uint64_t handle);
+
+  // RAII variant of observe(): the observer detaches when the returned
+  // Subscription is destroyed or reset().
+  Subscription subscribe(Observer fn);
 
  protected:
   YType* t_;
@@ -234,6 +272,10 @@ class Doc {
   using UpdateHandler = std::function<void(const std::vector<uint8_t>&, const std::string&)>;
   uint64_t onUpdate(UpdateHandler fn);
   void offUpdate(uint64_t handle);
+
+  // RAII variant of onUpdate(): the handler detaches when the returned
+  // Subscription is destroyed or reset().
+  Subscription subscribeUpdates(UpdateHandler fn);
 
   std::vector<uint8_t> encodeStateAsUpdate() const;
   // remoteStateVector: output of encodeStateVector() on the remote doc.

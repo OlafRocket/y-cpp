@@ -129,8 +129,11 @@ b.applyUpdate(a.encodeStateAsUpdate(b.encodeStateVector()));
 // b.getText().toString() == "hello"
 // b.toJson() == a.toJson()
 
-// Observers + update events (fire for local and remote changes alike):
-a.getText().observe([](const ycpp::Event& e) { /* e.delta, e.origin */ });
+// Observers + update events (fire for local and remote changes alike).
+// subscribe() returns a RAII Subscription that detaches on destruction;
+// observe() returns a manual handle for unobserve().
+ycpp::Subscription sub =
+    a.getText().subscribe([](const ycpp::Event& e) { /* e.delta, e.origin */ });
 a.onUpdate([](const std::vector<uint8_t>& update, const std::string& origin) {
   /* forward `update` to peers */
 });

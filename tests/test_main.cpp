@@ -585,6 +585,45 @@ TEST(observer_unobserve) {
   checkEq(fired, 1, "no events after unobserve");
 }
 
+TEST(subscription_raii) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  int fired = 0;
+  {
+    ycpp::Subscription sub = t.subscribe([&](const ycpp::Event&) { fired++; });
+    check(sub.active(), "subscription active");
+    t.insert(0, "a");
+    checkEq(fired, 1, "fires while in scope");
+  }
+  t.insert(0, "b");
+  checkEq(fired, 1, "auto-detached at scope exit");
+
+  // Move semantics: only the final owner detaches.
+  ycpp::Subscription outer;
+  {
+    ycpp::Subscription inner = t.subscribe([&](const ycpp::Event&) { fired++; });
+    outer = std::move(inner);
+    check(!inner.active() && outer.active(), "moved-from is inactive");
+  }
+  t.insert(0, "c");
+  checkEq(fired, 2, "moved subscription still fires");
+  outer.reset();
+  check(!outer.active(), "reset deactivates");
+  t.insert(0, "d");
+  checkEq(fired, 2, "no events after reset");
+
+  // Doc update-handler flavor.
+  int updates = 0;
+  {
+    auto usub = d.subscribeUpdates(
+        [&](const std::vector<uint8_t>&, const std::string&) { updates++; });
+    t.insert(0, "e");
+    checkEq(updates, 1, "update subscription fires");
+  }
+  t.insert(0, "f");
+  checkEq(updates, 1, "update subscription auto-detached");
+}
+
 TEST(on_update_event) {
   ycpp::Doc a(1);
   std::vector<std::vector<uint8_t>> updates;

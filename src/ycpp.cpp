@@ -1182,6 +1182,31 @@ void Doc::offUpdate(uint64_t handle) {
       updateHandlers_.end());
 }
 
+void Subscription::reset() {
+  if (type_ != nullptr) {
+    TypeRef(type_).unobserve(handle_);
+  } else if (doc_ != nullptr) {
+    doc_->offUpdate(handle_);
+  }
+  type_ = nullptr;
+  doc_ = nullptr;
+  handle_ = 0;
+}
+
+Subscription TypeRef::subscribe(Observer fn) {
+  Subscription sub;
+  sub.type_ = t_;
+  sub.handle_ = observe(std::move(fn));
+  return sub;
+}
+
+Subscription Doc::subscribeUpdates(UpdateHandler fn) {
+  Subscription sub;
+  sub.doc_ = this;
+  sub.handle_ = onUpdate(std::move(fn));
+  return sub;
+}
+
 uint64_t TypeRef::observe(Observer fn) {
   uint64_t handle = t_->doc->nextHandle_++;
   t_->observers.emplace_back(handle, std::move(fn));
