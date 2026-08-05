@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ycpp VERSION 0.5.0 LANGUAGES CXX)
+project(ycpp VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,7 +10,13 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
-add_library(ycpp STATIC src/ycpp.cpp)
+add_library(ycpp STATIC
+  src/doc.cpp
+  src/integrate.cpp
+  src/store.cpp
+  src/transaction.cpp
+  src/types.cpp
+  src/update_codec.cpp)
 target_include_directories(ycpp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(ycpp-cli tools/ycpp_cli.cpp)

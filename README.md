@@ -42,6 +42,33 @@ Out of scope for now: XML types (decoded/preserved, no API), rich-text
 attributes, subdocuments, deep (subtree) observers, v2 encoding, undo,
 awareness, transports. See the feature doc.
 
+## Project layout
+
+Headers are split by concern; `#include <ycpp/ycpp.hpp>` is the umbrella that
+pulls in everything (individual headers can be included directly):
+
+```
+include/ycpp/
+  lib0.hpp      lib0 binary primitives (varints, strings, floats)
+  utf.hpp       UTF-8 <-> UTF-16 with JavaScript semantics
+  any.hpp       the lib0 "Any" value model + binary codec
+  json.hpp      JSON text output for Any values
+  item.hpp      Item: the CRDT content atom (+ ID, content kinds)
+  event.hpp     observer events, deltas, map changes, Subscription
+  type.hpp      YType: the shared type node (list start + key map)
+  wrappers.hpp  Text / Array / Map public handles
+  doc.hpp       Doc: store, transactions, update codec entry points
+  ycpp.hpp      umbrella header
+src/
+  doc.cpp           construction, arenas, root types, validate
+  store.cpp         item splitting, deletion, merging, freeing
+  integrate.cpp     YATA integration, pending structs, delete ranges
+  update_codec.cpp  Yjs v1 update decode/encode
+  transaction.cpp   transactions, events, observers, subscriptions
+  types.cpp         list/map operations, wrappers, JSON dump
+  internal.hpp      shared implementation helpers (not installed)
+```
+
 ## Build & test
 
 Requires a C++20 compiler (GCC 10+, Clang 13+, MSVC 19.29+) and CMake 3.16+.
