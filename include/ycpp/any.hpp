@@ -87,7 +87,7 @@ inline void write(lib0::Encoder& enc, const Any& a) {
     case Any::Kind::Binary:
       enc.writeUint8(116);
       enc.writeVarUint(a.bin.size());
-      enc.writeBytes(a.bin.data(), a.bin.size());
+      enc.writeBytes(a.bin);
       break;
     case Any::Kind::List:
       enc.writeUint8(117);

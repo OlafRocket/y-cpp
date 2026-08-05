@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@
 
 namespace ycpp_tools {
 
-inline std::string base64Encode(const std::vector<uint8_t>& data) {
+inline std::string base64Encode(std::span<const uint8_t> data) {
   return macaron::Base64::Encode(std::string(data.begin(), data.end()));
 }
 

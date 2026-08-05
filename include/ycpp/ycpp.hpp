@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -211,8 +212,8 @@ class Text : public TypeRef {
   void insert(uint64_t index, const std::string& utf8);
   void insertUtf16(uint64_t index, const std::u16string& s);
   void remove(uint64_t index, uint64_t delLen);
-  std::string toString() const;  // UTF-8
-  std::u16string toUtf16() const;
+  [[nodiscard]] std::string toString() const;  // UTF-8
+  [[nodiscard]] std::u16string toUtf16() const;
 };
 
 class Array : public TypeRef {
@@ -266,7 +267,7 @@ class Doc {
   // Apply a Yjs v1 update. Structs with missing causal dependencies are kept
   // pending and retried on subsequent calls. Runs in a transaction: observers
   // and update handlers fire with the given origin and local == false.
-  void applyUpdate(const std::vector<uint8_t>& update, const std::string& origin = "");
+  void applyUpdate(std::span<const uint8_t> update, const std::string& origin = "");
 
   // Batch several mutations into one transaction: observers and update
   // handlers fire once, at the end. Nested calls join the outer transaction.
@@ -283,13 +284,13 @@ class Doc {
   // Subscription is destroyed or reset().
   Subscription subscribeUpdates(UpdateHandler fn);
 
-  std::vector<uint8_t> encodeStateAsUpdate() const;
+  [[nodiscard]] std::vector<uint8_t> encodeStateAsUpdate() const;
   // remoteStateVector: output of encodeStateVector() on the remote doc.
-  std::vector<uint8_t> encodeStateAsUpdate(const std::vector<uint8_t>& remoteStateVector) const;
-  std::vector<uint8_t> encodeStateVector() const;
+  [[nodiscard]] std::vector<uint8_t> encodeStateAsUpdate(std::span<const uint8_t> remoteStateVector) const;
+  [[nodiscard]] std::vector<uint8_t> encodeStateVector() const;
 
   // Next expected clock for a client (0 if unknown).
-  uint64_t getState(uint64_t client) const;
+  [[nodiscard]] uint64_t getState(uint64_t client) const;
 
   // True if some received structs/deletes still await missing dependencies.
   bool hasPending() const { return !pending_.empty() || !pendingDs_.empty(); }
@@ -308,7 +309,7 @@ class Doc {
   static void setValidateAfterTransactions(bool on) { validateAfterTx_ = on; }
 
   // JSON dump of every root type (sorted by name), for inspection/testing.
-  std::string toJson() const;
+  [[nodiscard]] std::string toJson() const;
 
  private:
   friend class TypeRef;

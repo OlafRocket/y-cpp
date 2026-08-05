@@ -2,8 +2,10 @@
 // update format): unsigned LEB128 var-ints and length-prefixed UTF-8 strings.
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <cstddef>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,9 +47,7 @@ class Encoder {
   }
 
   void writeFloat64BE(double v) {
-    uint64_t bits;
-    static_assert(sizeof(bits) == sizeof(v), "double must be 64-bit");
-    __builtin_memcpy(&bits, &v, sizeof bits);
+    uint64_t bits = std::bit_cast<uint64_t>(v);
     for (int i = 7; i >= 0; i--) buf_.push_back(static_cast<uint8_t>((bits >> (i * 8)) & 0xff));
   }
 
@@ -56,8 +56,8 @@ class Encoder {
     for (int i = 7; i >= 0; i--) buf_.push_back(static_cast<uint8_t>((bits >> (i * 8)) & 0xff));
   }
 
-  void writeBytes(const uint8_t* data, size_t len) {
-    buf_.insert(buf_.end(), data, data + len);
+  void writeBytes(std::span<const uint8_t> data) {
+    buf_.insert(buf_.end(), data.begin(), data.end());
   }
 
   const std::vector<uint8_t>& bytes() const { return buf_; }
@@ -69,8 +69,7 @@ class Encoder {
 
 class Decoder {
  public:
-  Decoder(const uint8_t* data, size_t len) : data_(data), len_(len) {}
-  explicit Decoder(const std::vector<uint8_t>& v) : Decoder(v.data(), v.size()) {}
+  explicit Decoder(std::span<const uint8_t> data) : data_(data.data()), len_(data.size()) {}
 
   bool hasContent() const { return pos_ < len_; }
 
@@ -123,17 +122,13 @@ class Decoder {
   double readFloat64BE() {
     uint64_t bits = 0;
     for (int i = 0; i < 8; i++) bits = (bits << 8) | readUint8();
-    double v;
-    __builtin_memcpy(&v, &bits, sizeof v);
-    return v;
+    return std::bit_cast<double>(bits);
   }
 
   double readFloat32BE() {
     uint32_t bits = 0;
     for (int i = 0; i < 4; i++) bits = (bits << 8) | readUint8();
-    float v;
-    __builtin_memcpy(&v, &bits, sizeof v);
-    return static_cast<double>(v);
+    return static_cast<double>(std::bit_cast<float>(bits));
   }
 
   int64_t readInt64BE() {

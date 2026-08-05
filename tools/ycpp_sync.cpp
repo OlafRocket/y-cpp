@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -47,8 +48,8 @@ namespace {
 std::atomic<bool> gQuit{false};
 void onSignal(int) { gQuit = true; }
 
-std::vector<uint8_t> toBytes(const std::string& s) {
-  return std::vector<uint8_t>(s.begin(), s.end());
+std::span<const uint8_t> asBytes(const std::string& s) {
+  return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
 }
 std::string toPayload(const std::vector<uint8_t>& v) {
   return std::string(v.begin(), v.end());
@@ -479,7 +480,7 @@ int runServe(const Options& opts) {
         std::lock_guard<std::mutex> lk(sd.mu);
         std::u16string before = sd.doc.getText().toUtf16();
         try {
-          sd.doc.applyUpdate(toBytes(msg->str), "remote");
+          sd.doc.applyUpdate(asBytes(msg->str), "remote");
         } catch (const std::exception& e) {
           std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
           return;
@@ -586,7 +587,7 @@ int runConnect(const Options& opts) {
       std::lock_guard<std::mutex> lk(sd.mu);
       std::u16string before = sd.doc.getText().toUtf16();
       try {
-        sd.doc.applyUpdate(toBytes(msg->str), "remote");
+        sd.doc.applyUpdate(asBytes(msg->str), "remote");
       } catch (const std::exception& e) {
         std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
         return;

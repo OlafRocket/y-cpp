@@ -75,7 +75,7 @@ void spliceContentLeft(Item* it, uint64_t offset) {
   it->len -= offset;
 }
 
-std::map<uint64_t, uint64_t> decodeStateVector(const std::vector<uint8_t>& bytes) {
+std::map<uint64_t, uint64_t> decodeStateVector(std::span<const uint8_t> bytes) {
   std::map<uint64_t, uint64_t> sv;
   lib0::Decoder dec(bytes);
   uint64_t n = dec.readVarUint();
@@ -614,7 +614,7 @@ DeleteRange Doc::applyDeleteRange(uint64_t client, uint64_t clock, uint64_t len)
 
 // ---------------------------------------------------------------- applyUpdate
 
-void Doc::applyUpdate(const std::vector<uint8_t>& update, const std::string& origin) {
+void Doc::applyUpdate(std::span<const uint8_t> update, const std::string& origin) {
   TxScope scope(this, origin, /*local=*/false);
   lib0::Decoder dec(update);
 
@@ -812,7 +812,7 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
       break;
     case ContentKind::Binary:
       enc.writeVarUint(it->bin.size());
-      enc.writeBytes(it->bin.data(), it->bin.size());
+      enc.writeBytes(it->bin);
       break;
     case ContentKind::String:
       enc.writeVarString(utf::utf16To8(it->str.substr(offset)));
@@ -973,7 +973,7 @@ std::vector<uint8_t> Doc::encodeStateAsUpdate() const {
   return encodeStateAsUpdateSv({});
 }
 
-std::vector<uint8_t> Doc::encodeStateAsUpdate(const std::vector<uint8_t>& remoteStateVector) const {
+std::vector<uint8_t> Doc::encodeStateAsUpdate(std::span<const uint8_t> remoteStateVector) const {
   return encodeStateAsUpdateSv(decodeStateVector(remoteStateVector));
 }
 
