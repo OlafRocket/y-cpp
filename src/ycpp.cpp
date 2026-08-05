@@ -807,7 +807,7 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
     case ContentKind::JSON:
       enc.writeVarUint(it->len - offset);
       for (uint64_t i = offset; i < it->anyVals.size(); i++) {
-        enc.writeVarString(it->anyVals[i].str);
+        enc.writeVarString(it->anyVals[i].str());
       }
       break;
     case ContentKind::Binary:
@@ -818,11 +818,11 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
       enc.writeVarString(utf::utf16To8(it->str.substr(offset)));
       break;
     case ContentKind::Embed:
-      enc.writeVarString(it->anyVals[0].str);
+      enc.writeVarString(it->anyVals[0].str());
       break;
     case ContentKind::Format:
       enc.writeVarString(it->key);
-      enc.writeVarString(it->anyVals[0].str);
+      enc.writeVarString(it->anyVals[0].str());
       break;
     case ContentKind::Type: {
       TypeKind k = it->typeContent ? it->typeContent->kind : TypeKind::Unknown;

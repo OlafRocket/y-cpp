@@ -302,8 +302,8 @@ TEST(any_codec_roundtrip) {
     ycpp::anycodec::write(enc, v);
     ycpp::lib0::Decoder dec(enc.bytes());
     ycpp::Any back = ycpp::anycodec::read(dec);
-    if (v.kind == Any::Kind::Int && (v.integer > 0x7fffffff || v.integer < -0x7fffffff)) {
-      checkEq(back.number, static_cast<double>(v.integer), "large int as float64");
+    if (v.kind() == Any::Kind::Int && (v.integer() > 0x7fffffff || v.integer() < -0x7fffffff)) {
+      checkEq(back.number(), static_cast<double>(v.integer()), "large int as float64");
     } else {
       check(back == v, "any roundtrip");
     }
@@ -328,8 +328,8 @@ TEST(array_local_ops) {
   arr.insert(0, {ycpp::Any::of(int64_t{1}), ycpp::Any::of("two"), ycpp::Any::of(3.5)});
   arr.push(ycpp::Any::of(true));
   checkEq(arr.length(), uint64_t(4), "length");
-  checkEq(arr.get(1).any.str, std::string("two"), "get middle");
-  check(arr.get(3).any.boolean, "get pushed");
+  checkEq(arr.get(1).any.str(), std::string("two"), "get middle");
+  check(arr.get(3).any.boolean(), "get pushed");
   arr.remove(1, 2);
   checkEq(arr.length(), uint64_t(2), "length after remove");
   checkEq(arr.toJson(), std::string("[1,true]"), "json");
@@ -358,9 +358,9 @@ TEST(map_local_ops) {
   m.set("b", ycpp::Any::of("x"));
   checkEq(m.size(), size_t(2), "size");
   check(m.has("a") && m.has("b") && !m.has("c"), "has");
-  checkEq(m.get("b")->any.str, std::string("x"), "get");
+  checkEq(m.get("b")->any.str(), std::string("x"), "get");
   m.set("a", ycpp::Any::of(int64_t{2}));  // overwrite
-  checkEq(m.get("a")->any.integer, int64_t{2}, "overwrite");
+  checkEq(m.get("a")->any.integer(), int64_t{2}, "overwrite");
   m.remove("b");
   check(!m.has("b"), "removed");
   checkEq(m.toJson(), std::string("{\"a\":2}"), "json");
@@ -375,7 +375,7 @@ TEST(map_concurrent_set_same_key) {
   b.getMap("m").set("k", ycpp::Any::of("from-b"));
   sync(a, b);
   checkEq(a.getMap("m").toJson(), b.getMap("m").toJson(), "converged");
-  checkEq(a.getMap("m").get("k")->any.str, std::string("from-b"), "higher client wins");
+  checkEq(a.getMap("m").get("k")->any.str(), std::string("from-b"), "higher client wins");
 }
 
 TEST(map_update_roundtrip) {
@@ -535,7 +535,7 @@ TEST(observer_array_delta) {
   arr.insert(0, {ycpp::Any::of(int64_t{1}), ycpp::Any::of("two")});
   checkEq(events.size(), size_t(1), "insert event");
   checkEq(events[0].delta[0].values.size(), size_t(2), "two inserted values");
-  checkEq(events[0].delta[0].values[1].any.str, std::string("two"), "value content");
+  checkEq(events[0].delta[0].values[1].any.str(), std::string("two"), "value content");
   events.clear();
   arr.remove(0, 1);
   check(events[0].delta[0].kind == ycpp::DeltaOp::Kind::Delete, "delete op");
@@ -553,11 +553,11 @@ TEST(observer_map_keys) {
 
   m.set("k", ycpp::Any::of(int64_t{2}));
   check(events.back().keys.at("k").action == ycpp::MapChange::Action::Update, "update action");
-  checkEq(events.back().keys.at("k").oldValue->any.integer, int64_t{1}, "old value on update");
+  checkEq(events.back().keys.at("k").oldValue->any.integer(), int64_t{1}, "old value on update");
 
   m.remove("k");
   check(events.back().keys.at("k").action == ycpp::MapChange::Action::Delete, "delete action");
-  checkEq(events.back().keys.at("k").oldValue->any.integer, int64_t{2}, "old value on delete");
+  checkEq(events.back().keys.at("k").oldValue->any.integer(), int64_t{2}, "old value on delete");
   checkEq(events.size(), size_t(3), "three events");
 }
 
