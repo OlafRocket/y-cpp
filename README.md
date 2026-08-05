@@ -44,6 +44,8 @@ awareness, transports. See the feature doc.
 
 ## Build & test
 
+Requires a C++20 compiler (GCC 10+, Clang 13+, MSVC 19.29+) and CMake 3.16+.
+
 ```sh
 cmake -B build
 cmake --build build -j
