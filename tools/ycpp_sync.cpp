@@ -119,15 +119,14 @@ class RawTerm {
   bool enabled_ = false;
 };
 
-// A minimal text box over the shared document. Local edits are encoded as
-// state-vector diffs and handed to `send`; remote changes are applied by the
-// network callbacks, which use adjustCursorLocked() + markDirty().
+// A minimal text box over the shared document. Local edits run in doc
+// transactions; the doc's onUpdate handler (registered by serve/connect)
+// broadcasts them. Remote changes are applied by the network callbacks,
+// which use adjustCursorLocked() + markDirty().
 class Editor {
  public:
-  Editor(SharedDoc& sd, std::function<void(const std::vector<uint8_t>&)> send,
-         std::string title, std::function<std::string()> statusFn)
-      : sd_(sd), send_(std::move(send)), title_(std::move(title)),
-        statusFn_(std::move(statusFn)) {}
+  Editor(SharedDoc& sd, std::string title, std::function<std::string()> statusFn)
+      : sd_(sd), title_(std::move(title)), statusFn_(std::move(statusFn)) {}
 
   void markDirty() { dirty_ = true; }
 
@@ -181,33 +180,21 @@ class Editor {
   // ------------------------------------------------------------ edit ops
 
   void insertText(const std::u16string& s) {
-    std::vector<uint8_t> diff;
-    {
-      std::lock_guard<std::mutex> lk(sd_.mu);
-      auto t = sd_.doc.getText();
-      if (cursor_ > t.length()) cursor_ = t.length();
-      auto sv = sd_.doc.encodeStateVector();
-      t.insertUtf16(cursor_, s);
-      cursor_ += s.size();
-      diff = sd_.doc.encodeStateAsUpdate(sv);
-      sd_.saveLocked();
-    }
-    send_(diff);
+    std::lock_guard<std::mutex> lk(sd_.mu);
+    auto t = sd_.doc.getText();
+    if (cursor_ > t.length()) cursor_ = t.length();
+    t.insertUtf16(cursor_, s);  // onUpdate handler broadcasts the transaction
+    cursor_ += s.size();
+    sd_.saveLocked();
   }
 
-  void removeRange(uint64_t from, uint64_t to) {  // call with mu NOT held
-    std::vector<uint8_t> diff;
-    {
-      std::lock_guard<std::mutex> lk(sd_.mu);
-      auto t = sd_.doc.getText();
-      if (to > t.length() || from >= to) return;
-      auto sv = sd_.doc.encodeStateVector();
-      t.remove(from, to - from);
-      cursor_ = from;
-      diff = sd_.doc.encodeStateAsUpdate(sv);
-      sd_.saveLocked();
-    }
-    send_(diff);
+  void removeRange(uint64_t from, uint64_t to) {
+    std::lock_guard<std::mutex> lk(sd_.mu);
+    auto t = sd_.doc.getText();
+    if (to > t.length() || from >= to) return;
+    t.remove(from, to - from);
+    cursor_ = from;
+    sd_.saveLocked();
   }
 
   static uint64_t stepLeft(const std::u16string& t, uint64_t c) {
@@ -406,7 +393,6 @@ class Editor {
   }
 
   SharedDoc& sd_;
-  std::function<void(const std::vector<uint8_t>&)> send_;
   std::string title_;
   std::function<std::string()> statusFn_;
   uint64_t cursor_ = 0;  // UTF-16 units, guarded by sd_.mu
@@ -418,8 +404,7 @@ class Editor {
 
 class Editor {
  public:
-  Editor(SharedDoc&, std::function<void(const std::vector<uint8_t>&)>,
-         std::string, std::function<std::string()>) {}
+  Editor(SharedDoc&, std::string, std::function<std::string()>) {}
   void markDirty() {}
   void adjustCursorLocked(const std::u16string&, const std::u16string&) {}
   void run() { runHeadlessWait(); }
@@ -494,7 +479,7 @@ int runServe(const Options& opts) {
         std::lock_guard<std::mutex> lk(sd.mu);
         std::u16string before = sd.doc.getText().toUtf16();
         try {
-          sd.doc.applyUpdate(toBytes(msg->str));
+          sd.doc.applyUpdate(toBytes(msg->str), "remote");
         } catch (const std::exception& e) {
           std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
           return;
@@ -546,10 +531,13 @@ int runServe(const Options& opts) {
             << " (WebSocket on the same port, web dir: " << webDir << ")"
             << std::endl;
 
-  auto broadcastAll = [&server](const std::vector<uint8_t>& diff) {
-    std::string payload = toPayload(diff);
+  // Local transactions (terminal text box edits) broadcast to every peer;
+  // remote updates are relayed by the message callback above.
+  sd.doc.onUpdate([&server](const std::vector<uint8_t>& update, const std::string& origin) {
+    if (origin == "remote") return;
+    std::string payload = toPayload(update);
     for (const auto& client : server.getClients()) client->sendBinary(payload);
-  };
+  });
   auto status = [&server, &sd]() {
     size_t peers = server.getClients().size();
     std::lock_guard<std::mutex> lk(sd.mu);
@@ -561,7 +549,7 @@ int runServe(const Options& opts) {
     Editor::runHeadlessWait();
   } else {
     editor = std::make_unique<Editor>(
-        sd, broadcastAll, "ycpp-sync serve :" + std::to_string(opts.port), status);
+        sd, "ycpp-sync serve :" + std::to_string(opts.port), status);
     editor->run();
     editor.reset();
   }
@@ -598,7 +586,7 @@ int runConnect(const Options& opts) {
       std::lock_guard<std::mutex> lk(sd.mu);
       std::u16string before = sd.doc.getText().toUtf16();
       try {
-        sd.doc.applyUpdate(toBytes(msg->str));
+        sd.doc.applyUpdate(toBytes(msg->str), "remote");
       } catch (const std::exception& e) {
         std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
         return;
@@ -614,9 +602,11 @@ int runConnect(const Options& opts) {
   });
   ws.start();  // reconnects automatically
 
-  auto send = [&ws](const std::vector<uint8_t>& diff) {
-    ws.sendBinary(toPayload(diff));
-  };
+  // Local transactions are sent to the server; remote ones came from it.
+  sd.doc.onUpdate([&ws](const std::vector<uint8_t>& update, const std::string& origin) {
+    if (origin == "remote") return;
+    ws.sendBinary(toPayload(update));
+  });
   auto status = [&connected, &sd]() {
     std::string s = connected ? "connected" : "connecting...";
     std::lock_guard<std::mutex> lk(sd.mu);
@@ -627,7 +617,7 @@ int runConnect(const Options& opts) {
     std::cout << "ycpp-sync: connecting to " << opts.url << std::endl;
     Editor::runHeadlessWait();
   } else {
-    editor = std::make_unique<Editor>(sd, send, "ycpp-sync " + opts.url, status);
+    editor = std::make_unique<Editor>(sd, "ycpp-sync " + opts.url, status);
     editor->run();
     editor.reset();
   }

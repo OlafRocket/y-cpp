@@ -259,38 +259,19 @@ void Doc::deleteItem(Item* s) {
   if (s->deleted) return;
   s->deleted = true;
   if (s->countable() && !s->parentSub && s->parent) s->parent->length -= s->len;
-  switch (s->kind) {
-    // Garbage-collect droppable content right away (yjs Item.gc with a live
-    // parent): only the clock length is needed for sync.
-    case ContentKind::String:
-      s->str.clear();
-      s->str.shrink_to_fit();
-      s->kind = ContentKind::Deleted;
-      break;
-    case ContentKind::Any:
-      s->anyVals.clear();
-      s->anyVals.shrink_to_fit();
-      s->kind = ContentKind::Deleted;
-      break;
-    case ContentKind::Binary:
-      s->bin.clear();
-      s->bin.shrink_to_fit();
-      s->kind = ContentKind::Deleted;
-      break;
-    case ContentKind::Type:
-      // ContentType.delete: the whole subtree dies with its container. The
-      // type ref itself is kept (we do not convert children to GC structs).
-      if (s->typeContent) {
-        for (Item* c = s->typeContent->start; c != nullptr; c = c->right) {
-          if (!c->deleted) deleteItem(c);
-        }
-        for (auto& [k, item] : s->typeContent->map) {
-          if (!item->deleted) deleteItem(item);
-        }
-      }
-      break;
-    default:
-      break;  // JSON/Embed/Format/Doc kept opaque
+  // Content stays intact until transaction cleanup (events may read it);
+  // record the deletion and the changed type on the transaction.
+  if (tx_) tx_->ds[s->id.client].push_back(DeleteRange{s->id.clock, s->len});
+  if (s->parent) addChangedType(s->parent, s->parentSub);
+  if (s->kind == ContentKind::Type && s->typeContent) {
+    // ContentType.delete: the whole subtree dies with its container. The
+    // type ref itself is kept (we do not convert children to GC structs).
+    for (Item* c = s->typeContent->start; c != nullptr; c = c->right) {
+      if (!c->deleted) deleteItem(c);
+    }
+    for (auto& [k, item] : s->typeContent->map) {
+      if (!item->deleted) deleteItem(item);
+    }
   }
 }
 
@@ -332,15 +313,6 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
   return true;
 }
 
-void Doc::mergeAround(uint64_t client, uint64_t clock) {
-  auto sit = store_.find(client);
-  if (sit == store_.end() || sit->second.empty()) return;
-  auto& v = sit->second;
-  size_t pos = findIndex(v, clock);
-  tryMergeWithLeft(v, pos + 1);  // right neighbor into this item
-  tryMergeWithLeft(v, pos);      // this item into its left neighbor
-}
-
 // ---------------------------------------------------------------- integration
 
 bool Doc::depsMissing(const Item* it) const {
@@ -371,8 +343,6 @@ void Doc::integrateAsGc(Item* it, uint64_t offset) {
   it->typeContent = nullptr;
   it->left = it->right = nullptr;
   addStruct(it);
-  auto& v = store_[it->id.client];
-  tryMergeWithLeft(v, v.size() - 1);
 }
 
 // Port of yjs Item.getMissing (neighbor/parent resolution) + Item.integrate
@@ -502,16 +472,14 @@ void Doc::integrate(Item* it, uint64_t offset) {
 
   if (!it->parentSub && it->countable() && !it->deleted) parent->length += it->len;
   addStruct(it);
+  addChangedType(parent, it->parentSub);
 
   // Delete if the parent container is deleted, or if this is a stale map value.
   if ((parent->item != nullptr && parent->item->deleted) ||
       (it->parentSub && it->right != nullptr)) {
     deleteItem(it);
   }
-
-  // Compact: a run typed by one client collapses back into a single item.
-  auto& v = store_[it->id.client];
-  tryMergeWithLeft(v, v.size() - 1);
+  // Merging happens at transaction cleanup (after events are computed).
 }
 
 void Doc::integrateLoop() {
@@ -560,11 +528,6 @@ DeleteRange Doc::applyDeleteRange(uint64_t client, uint64_t clock, uint64_t len)
         deleteItem(s);
       }
     }
-    // Compact the freshly deleted run (and its boundaries) into merged tombstones.
-    size_t pos = findIndex(v, clock);
-    while (pos < v.size() && v[pos]->id.clock <= applyEnd) {
-      if (!tryMergeWithLeft(v, pos)) pos++;
-    }
   }
   uint64_t restStart = std::max(clock, applyEnd);
   return DeleteRange{restStart, end - restStart};
@@ -572,7 +535,8 @@ DeleteRange Doc::applyDeleteRange(uint64_t client, uint64_t clock, uint64_t len)
 
 // ---------------------------------------------------------------- applyUpdate
 
-void Doc::applyUpdate(const std::vector<uint8_t>& update) {
+void Doc::applyUpdate(const std::vector<uint8_t>& update, const std::string& origin) {
+  TxScope scope(this, origin, /*local=*/false);
   lib0::Decoder dec(update);
 
   // Struct section.
@@ -927,6 +891,310 @@ std::vector<uint8_t> Doc::encodeStateVector() const {
   return enc.take();
 }
 
+// -------------------------------------------------------------- transactions
+
+void Doc::beginTransaction(const std::string& origin, bool local) {
+  if (txDepth_++ == 0) {
+    tx_ = std::make_unique<Transaction>();
+    tx_->origin = origin;
+    tx_->local = local;
+    for (const auto& [client, v] : store_) tx_->beforeState[client] = getState(client);
+  }
+}
+
+void Doc::endTransaction() {
+  if (--txDepth_ == 0) {
+    std::unique_ptr<Transaction> tx = std::move(tx_);
+    cleanupTransaction(*tx);
+  }
+}
+
+void Doc::transact(const std::function<void()>& fn, const std::string& origin) {
+  TxScope scope(this, origin, /*local=*/true);
+  fn();
+}
+
+// yjs addChangedTypeToTransaction: only report types that existed before the
+// transaction and are not deleted (a brand-new nested type's changes are
+// covered by its parent's insert event).
+void Doc::addChangedType(YType* t, const std::optional<std::string>& sub) {
+  if (!tx_) return;
+  const Item* item = t->item;
+  bool track = item == nullptr;
+  if (!track) {
+    auto b = tx_->beforeState.find(item->id.client);
+    uint64_t before = b == tx_->beforeState.end() ? 0 : b->second;
+    track = item->id.clock < before && !item->deleted;
+  }
+  if (track) tx_->changed[t].insert(sub);
+}
+
+// yjs YEvent.adds: created during this transaction.
+bool Doc::txAdds(const Transaction& tx, const Item* it) {
+  auto b = tx.beforeState.find(it->id.client);
+  uint64_t before = b == tx.beforeState.end() ? 0 : b->second;
+  return it->id.clock >= before;
+}
+
+// yjs YEvent.deletes: deleted during this transaction (tx.ds is sorted/merged).
+bool Doc::txDeletes(const Transaction& tx, const Item* it) {
+  auto d = tx.ds.find(it->id.client);
+  if (d == tx.ds.end()) return false;
+  const auto& rs = d->second;
+  size_t lo = 0, hi = rs.size();
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (rs[mid].clock <= it->id.clock) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo == 0) return false;
+  const DeleteRange& r = rs[lo - 1];
+  return it->id.clock < r.clock + r.len;
+}
+
+// Port of yjs YEvent.changes (list delta): classify every item in list order
+// as inserted / deleted / retained relative to this transaction.
+void Doc::buildDelta(const Transaction& tx, const YType* t, Event& ev) const {
+  DeltaOp cur;
+  bool has = false;
+  auto flush = [&] {
+    if (has) {
+      ev.delta.push_back(std::move(cur));
+      cur = DeltaOp();
+      has = false;
+    }
+  };
+  auto begin = [&](DeltaOp::Kind k) {
+    if (!has || cur.kind != k) {
+      flush();
+      cur.kind = k;
+      has = true;
+    }
+  };
+  for (const Item* item = t->start; item != nullptr; item = item->right) {
+    if (item->deleted) {
+      if (txDeletes(tx, item) && !txAdds(tx, item)) {
+        begin(DeltaOp::Kind::Delete);
+        cur.length += item->len;
+      }  // else: deleted before the tx, or added+deleted within it — invisible
+    } else if (txAdds(tx, item)) {
+      begin(DeltaOp::Kind::Insert);
+      cur.length += item->len;
+      if (item->kind == ContentKind::String) {
+        cur.str += item->str;
+      } else {
+        for (uint64_t i = 0; i < item->len; i++) cur.values.push_back(valueAt(item, i));
+      }
+    } else {
+      begin(DeltaOp::Kind::Retain);
+      cur.length += item->len;
+    }
+  }
+  if (has && cur.kind != DeltaOp::Kind::Retain) flush();  // drop trailing retain
+}
+
+// Port of yjs YEvent.keys: action + oldValue for one changed map key.
+void Doc::buildKeyChange(const Transaction& tx, const YType* t, const std::string& key,
+                         Event& ev) const {
+  auto mit = t->map.find(key);
+  if (mit == t->map.end()) return;
+  const Item* item = mit->second;
+  MapChange change;
+  if (txAdds(tx, item)) {
+    const Item* prev = item->left;
+    while (prev != nullptr && txAdds(tx, prev)) prev = prev->left;
+    if (item->deleted) {
+      if (prev != nullptr && txDeletes(tx, prev)) {
+        change.action = MapChange::Action::Delete;
+        change.oldValue = valueAt(prev, prev->len - 1);
+      } else {
+        return;  // added and deleted within the transaction: invisible
+      }
+    } else if (prev != nullptr && txDeletes(tx, prev)) {
+      change.action = MapChange::Action::Update;
+      change.oldValue = valueAt(prev, prev->len - 1);
+    } else {
+      change.action = MapChange::Action::Add;
+    }
+  } else if (txDeletes(tx, item)) {
+    change.action = MapChange::Action::Delete;
+    change.oldValue = valueAt(item, item->len - 1);
+  } else {
+    return;  // nop
+  }
+  ev.keys[key] = std::move(change);
+}
+
+// The transaction encoded as an incremental v1 update: structs added during
+// the transaction plus its delete set (yjs writeUpdateMessageFromTransaction).
+std::vector<uint8_t> Doc::encodeTransactionUpdate(const Transaction& tx) const {
+  lib0::Encoder enc;
+  std::map<uint64_t, uint64_t> sm;  // client -> encode-from clock
+  for (const auto& [client, v] : store_) {
+    auto b = tx.beforeState.find(client);
+    uint64_t before = b == tx.beforeState.end() ? 0 : b->second;
+    if (getState(client) > before) sm[client] = before;
+  }
+  enc.writeVarUint(sm.size());
+  for (auto rit = sm.rbegin(); rit != sm.rend(); ++rit) {  // descending client order
+    const auto& v = store_.at(rit->first);
+    uint64_t clock = std::max(rit->second, v[0]->id.clock);
+    size_t start = findIndex(v, clock);
+    enc.writeVarUint(v.size() - start);
+    enc.writeVarUint(rit->first);
+    enc.writeVarUint(clock);
+    writeStruct(enc, v[start], clock - v[start]->id.clock);
+    for (size_t i = start + 1; i < v.size(); i++) writeStruct(enc, v[i], 0);
+  }
+  enc.writeVarUint(tx.ds.size());
+  for (auto rit = tx.ds.rbegin(); rit != tx.ds.rend(); ++rit) {
+    enc.writeVarUint(rit->first);
+    enc.writeVarUint(rit->second.size());
+    for (const DeleteRange& r : rit->second) {
+      enc.writeVarUint(r.clock);
+      enc.writeVarUint(r.len);
+    }
+  }
+  return enc.take();
+}
+
+// yjs cleanupTransactions order: finalize ds -> observers -> gc -> merge ->
+// doc "update" handlers.
+void Doc::cleanupTransaction(Transaction& tx) {
+  // Finalize the transaction delete set (sort + merge overlapping ranges).
+  for (auto& [client, ranges] : tx.ds) {
+    std::sort(ranges.begin(), ranges.end(),
+              [](const DeleteRange& a, const DeleteRange& b) { return a.clock < b.clock; });
+    std::vector<DeleteRange> merged;
+    for (const DeleteRange& r : ranges) {
+      if (!merged.empty() && r.clock <= merged.back().clock + merged.back().len) {
+        merged.back().len = std::max(merged.back().len, r.clock + r.len - merged.back().clock);
+      } else {
+        merged.push_back(r);
+      }
+    }
+    ranges = std::move(merged);
+  }
+
+  // 1. Type observers (content is still un-GC'd so events can carry it).
+  if (!tx.changed.empty()) {
+    auto changedCopy = tx.changed;
+    for (const auto& [type, subs] : changedCopy) {
+      if (type->observers.empty()) continue;
+      Event ev;
+      ev.target = type;
+      ev.origin = tx.origin;
+      ev.local = tx.local;
+      if (subs.count(std::nullopt) != 0) buildDelta(tx, type, ev);
+      for (const auto& sub : subs) {
+        if (sub) buildKeyChange(tx, type, *sub, ev);
+      }
+      auto observers = type->observers;  // copy: callbacks may unobserve
+      for (const auto& [handle, fn] : observers) fn(ev);
+    }
+  }
+
+  // 2. Garbage-collect droppable content deleted in this transaction.
+  for (const auto& [client, ranges] : tx.ds) {
+    auto sit = store_.find(client);
+    if (sit == store_.end()) continue;
+    auto& v = sit->second;
+    for (const DeleteRange& r : ranges) {
+      size_t idx = findIndex(v, r.clock);
+      while (idx < v.size() && v[idx]->id.clock < r.clock + r.len) {
+        Item* s = v[idx++];
+        if (!s->deleted) continue;
+        switch (s->kind) {
+          case ContentKind::String:
+            s->str.clear();
+            s->str.shrink_to_fit();
+            s->kind = ContentKind::Deleted;
+            break;
+          case ContentKind::Any:
+            s->anyVals.clear();
+            s->anyVals.shrink_to_fit();
+            s->kind = ContentKind::Deleted;
+            break;
+          case ContentKind::Binary:
+            s->bin.clear();
+            s->bin.shrink_to_fit();
+            s->kind = ContentKind::Deleted;
+            break;
+          default:
+            break;  // Type refs and opaque content are kept
+        }
+      }
+    }
+  }
+
+  // 3. Compaction: merge across this transaction's delete ranges and new structs.
+  for (const auto& [client, ranges] : tx.ds) {
+    auto sit = store_.find(client);
+    if (sit == store_.end()) continue;
+    auto& v = sit->second;
+    for (const DeleteRange& r : ranges) {
+      size_t pos = findIndex(v, r.clock);
+      while (pos < v.size() && v[pos]->id.clock <= r.clock + r.len) {
+        if (!tryMergeWithLeft(v, pos)) pos++;
+      }
+    }
+  }
+  for (auto& [client, v] : store_) {
+    if (v.empty()) continue;
+    auto b = tx.beforeState.find(client);
+    uint64_t before = b == tx.beforeState.end() ? 0 : b->second;
+    if (getState(client) <= before) continue;
+    size_t pos = findIndex(v, std::max(before, v[0]->id.clock));
+    while (pos < v.size()) {
+      if (!tryMergeWithLeft(v, pos)) pos++;
+    }
+  }
+
+  // 4. Doc update handlers.
+  bool changedAny = !tx.ds.empty();
+  if (!changedAny) {
+    for (const auto& [client, v] : store_) {
+      auto b = tx.beforeState.find(client);
+      uint64_t before = b == tx.beforeState.end() ? 0 : b->second;
+      if (getState(client) > before) {
+        changedAny = true;
+        break;
+      }
+    }
+  }
+  if (changedAny && !updateHandlers_.empty()) {
+    std::vector<uint8_t> update = encodeTransactionUpdate(tx);
+    auto handlers = updateHandlers_;  // copy: callbacks may offUpdate
+    for (const auto& [handle, fn] : handlers) fn(update, tx.origin);
+  }
+}
+
+uint64_t Doc::onUpdate(UpdateHandler fn) {
+  uint64_t handle = nextHandle_++;
+  updateHandlers_.emplace_back(handle, std::move(fn));
+  return handle;
+}
+
+void Doc::offUpdate(uint64_t handle) {
+  updateHandlers_.erase(
+      std::remove_if(updateHandlers_.begin(), updateHandlers_.end(),
+                     [&](const auto& p) { return p.first == handle; }),
+      updateHandlers_.end());
+}
+
+uint64_t TypeRef::observe(Observer fn) {
+  uint64_t handle = t_->doc->nextHandle_++;
+  t_->observers.emplace_back(handle, std::move(fn));
+  return handle;
+}
+
+void TypeRef::unobserve(uint64_t handle) {
+  auto& obs = t_->observers;
+  obs.erase(std::remove_if(obs.begin(), obs.end(),
+                           [&](const auto& p) { return p.first == handle; }),
+            obs.end());
+}
+
 // ------------------------------------------------------------ list/map ops
 
 Doc::ListPos Doc::findListPosition(YType* t, uint64_t index) {
@@ -950,6 +1218,7 @@ Doc::ListPos Doc::findListPosition(YType* t, uint64_t index) {
 
 void Doc::listInsert(YType* t, uint64_t index, Item* it) {
   if (index > t->length) throw std::out_of_range("ycpp: insert index out of range");
+  TxScope scope(this, "", /*local=*/true);
   ListPos pos = findListPosition(t, index);
   it->id = ID{clientId_, getState(clientId_)};
   it->origin = pos.left ? std::optional<ID>(pos.left->lastId()) : std::nullopt;
@@ -963,24 +1232,23 @@ void Doc::listInsert(YType* t, uint64_t index, Item* it) {
 void Doc::listRemove(YType* t, uint64_t index, uint64_t delLen) {
   if (delLen == 0) return;
   if (index + delLen > t->length) throw std::out_of_range("ycpp: remove range out of range");
+  TxScope scope(this, "", /*local=*/true);
   ListPos pos = findListPosition(t, index);
   Item* right = pos.right;
   uint64_t remaining = delLen;
-  std::vector<ID> marked;
   while (remaining > 0 && right) {
     if (!right->deleted && right->countable()) {
       if (remaining < right->len) splitItem(right, remaining);
       deleteItem(right);
-      marked.push_back(right->id);
       remaining -= right->len;
     }
     right = right->right;
   }
-  // Compact after the walk (merging during it would invalidate the traversal).
-  for (const ID& id : marked) mergeAround(id.client, id.clock);
+  // Compaction happens at transaction cleanup.
 }
 
 void Doc::mapSet(YType* t, const std::string& key, Item* it) {
+  TxScope scope(this, "", /*local=*/true);
   auto mit = t->map.find(key);
   Item* left = mit == t->map.end() ? nullptr : mit->second;
   it->id = ID{clientId_, getState(clientId_)};
@@ -1102,7 +1370,10 @@ void Map::set(const std::string& key, const Any& value) {
 
 void Map::remove(const std::string& key) {
   auto mit = t_->map.find(key);
-  if (mit != t_->map.end() && !mit->second->deleted) t_->doc->deleteItem(mit->second);
+  if (mit != t_->map.end() && !mit->second->deleted) {
+    Doc::TxScope scope(t_->doc, "", /*local=*/true);
+    t_->doc->deleteItem(mit->second);
+  }
 }
 
 bool Map::has(const std::string& key) const {

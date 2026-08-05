@@ -9,9 +9,11 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +54,43 @@ enum class TypeKind : uint8_t {
 
 class Doc;
 struct YType;
+
+// The result of reading one position/key: either a plain value or a nested
+// shared type (inspect with the wrapper classes below).
+struct Value {
+  Any any;
+  YType* type = nullptr;
+  bool isType() const { return type != nullptr; }
+};
+
+// One operation of a list-type change description (Quill-style delta).
+struct DeltaOp {
+  enum class Kind { Retain, Insert, Delete };
+  Kind kind = Kind::Retain;
+  uint64_t length = 0;        // retain/delete count; also insert length
+  std::u16string str;         // inserted text (from ContentString items)
+  std::vector<Value> values;  // inserted values (from other content)
+};
+
+// One changed key of a map-type change description.
+struct MapChange {
+  enum class Action { Add, Update, Delete };
+  Action action = Action::Add;
+  std::optional<Value> oldValue;  // value before the transaction (Update/Delete)
+};
+
+// Fired on observers at the end of the transaction that changed the type.
+// Computed like yjs YEvent.changes/.keys: from the transaction's before-state
+// and delete set, before any content is garbage-collected.
+struct Event {
+  YType* target = nullptr;
+  std::string origin;  // transact()/applyUpdate() origin tag
+  bool local = true;   // false when produced by applyUpdate
+  std::vector<DeltaOp> delta;         // list changes (Text/Array)
+  std::map<std::string, MapChange> keys;  // map key changes
+};
+
+using Observer = std::function<void(const Event&)>;
 
 struct Item {
   ID id;
@@ -97,14 +136,7 @@ struct YType {
   std::map<std::string, Item*> map;    // parentSub -> most recent item
   uint64_t length = 0;                 // countable list length (UTF-16 for text)
   Doc* doc = nullptr;
-};
-
-// The result of reading one position/key: either a plain value or a nested
-// shared type (inspect with the wrapper classes below).
-struct Value {
-  Any any;
-  YType* type = nullptr;
-  bool isType() const { return type != nullptr; }
+  std::vector<std::pair<uint64_t, Observer>> observers;
 };
 
 class Text;
@@ -118,6 +150,11 @@ class TypeRef {
   TypeRef(YType* t) : t_(t) {}
   uint64_t length() const { return t_->length; }
   YType* node() const { return t_; }
+
+  // Observers fire at the end of the transaction that changed this type
+  // (local edits and applyUpdate alike). Returns a handle for unobserve().
+  uint64_t observe(Observer fn);
+  void unobserve(uint64_t handle);
 
  protected:
   YType* t_;
@@ -183,8 +220,20 @@ class Doc {
   Map getMap(const std::string& name = "default");
 
   // Apply a Yjs v1 update. Structs with missing causal dependencies are kept
-  // pending and retried on subsequent calls.
-  void applyUpdate(const std::vector<uint8_t>& update);
+  // pending and retried on subsequent calls. Runs in a transaction: observers
+  // and update handlers fire with the given origin and local == false.
+  void applyUpdate(const std::vector<uint8_t>& update, const std::string& origin = "");
+
+  // Batch several mutations into one transaction: observers and update
+  // handlers fire once, at the end. Nested calls join the outer transaction.
+  void transact(const std::function<void()>& fn, const std::string& origin = "");
+
+  // Called at the end of every transaction that changed the doc, with the
+  // transaction encoded as an incremental v1 update (what a sync provider
+  // forwards) and the transaction origin. Returns a handle for offUpdate().
+  using UpdateHandler = std::function<void(const std::vector<uint8_t>&, const std::string&)>;
+  uint64_t onUpdate(UpdateHandler fn);
+  void offUpdate(uint64_t handle);
 
   std::vector<uint8_t> encodeStateAsUpdate() const;
   // remoteStateVector: output of encodeStateVector() on the remote doc.
@@ -204,9 +253,35 @@ class Doc {
   std::string toJson() const;
 
  private:
+  friend class TypeRef;
   friend class Text;
   friend class Array;
   friend class Map;
+
+  struct Transaction {
+    std::map<uint64_t, uint64_t> beforeState;
+    std::map<uint64_t, std::vector<DeleteRange>> ds;  // deletes made in this tx
+    std::map<YType*, std::set<std::optional<std::string>>> changed;
+    std::string origin;
+    bool local = true;
+  };
+  struct TxScope {  // RAII: every mutation path opens an implicit transaction
+    Doc* d;
+    TxScope(Doc* doc, const std::string& origin, bool local) : d(doc) {
+      d->beginTransaction(origin, local);
+    }
+    ~TxScope() { d->endTransaction(); }
+  };
+  void beginTransaction(const std::string& origin, bool local);
+  void endTransaction();
+  void cleanupTransaction(Transaction& tx);
+  void addChangedType(YType* t, const std::optional<std::string>& sub);
+  static bool txAdds(const Transaction& tx, const Item* it);
+  static bool txDeletes(const Transaction& tx, const Item* it);
+  std::vector<uint8_t> encodeTransactionUpdate(const Transaction& tx) const;
+  void buildDelta(const Transaction& tx, const YType* t, Event& ev) const;
+  void buildKeyChange(const Transaction& tx, const YType* t, const std::string& key,
+                      Event& ev) const;
 
   Item* alloc();
   YType* allocType(TypeKind kind);
@@ -216,11 +291,9 @@ class Doc {
   Item* getItemCleanStart(const ID& id);
   Item* getItemCleanEnd(const ID& id);
   Item* splitItem(Item* it, uint64_t diff);
-  void deleteItem(Item* s);  // tombstone + gc string content + cascade types
+  void deleteItem(Item* s);  // tombstone + record in tx + cascade types
   // Merges v[pos] into v[pos-1] if the yjs merge conditions hold (frees v[pos]).
   bool tryMergeWithLeft(std::vector<Item*>& v, size_t pos);
-  // Attempts merges around the struct containing (client, clock).
-  void mergeAround(uint64_t client, uint64_t clock);
 
   bool depsMissing(const Item* it) const;
   void integrate(Item* it, uint64_t offset);
@@ -261,6 +334,11 @@ class Doc {
   std::unordered_map<Item*, std::unique_ptr<Item>> items_;  // ownership; erased on merge
   std::map<uint64_t, std::deque<Item*>> pending_;         // structs awaiting deps
   std::map<uint64_t, std::vector<DeleteRange>> pendingDs_;  // deletes awaiting structs
+
+  std::unique_ptr<Transaction> tx_;
+  int txDepth_ = 0;
+  uint64_t nextHandle_ = 1;  // observer / update-handler handles
+  std::vector<std::pair<uint64_t, UpdateHandler>> updateHandlers_;
 };
 
 }  // namespace ycpp

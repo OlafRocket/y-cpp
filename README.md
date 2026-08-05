@@ -23,6 +23,11 @@ lib0 v1 update codec); the Rust implementation
 - Legacy/unsupported content (`ContentJSON`, `ContentEmbed`, `ContentFormat`,
   `ContentDoc`) is decoded, preserved, and re-encoded opaquely instead of
   rejected
+- Transactions and observers (since 0.4): `doc.transact()` batching with
+  origin tags, `observe()` on any type (Quill-style deltas for Text/Array,
+  per-key changes with old values for Map, for local and remote changes
+  alike), and `doc.onUpdate()` delivering each transaction as an incremental
+  v1 update — the hook a sync provider subscribes to
 - Yjs **v1 update** encode/decode: `applyUpdate`, `encodeStateAsUpdate`,
   `encodeStateVector`, state-vector–based diff sync
 - YATA conflict resolution — byte-for-byte the same ordering decisions as yjs
@@ -34,8 +39,8 @@ lib0 v1 update codec); the Rust implementation
   preserved across re-encodes)
 
 Out of scope for now: XML types (decoded/preserved, no API), rich-text
-attributes, subdocuments, v2 encoding, undo, awareness, transports. See the
-feature doc.
+attributes, subdocuments, deep (subtree) observers, v2 encoding, undo,
+awareness, transports. See the feature doc.
 
 ## Build & test
 
@@ -123,6 +128,13 @@ nested.set("deep", ycpp::Any::of(true));
 b.applyUpdate(a.encodeStateAsUpdate(b.encodeStateVector()));
 // b.getText().toString() == "hello"
 // b.toJson() == a.toJson()
+
+// Observers + update events (fire for local and remote changes alike):
+a.getText().observe([](const ycpp::Event& e) { /* e.delta, e.origin */ });
+a.onUpdate([](const std::vector<uint8_t>& update, const std::string& origin) {
+  /* forward `update` to peers */
+});
+a.transact([&] { /* several edits -> one event, one update */ }, "my-origin");
 ```
 
 ## License

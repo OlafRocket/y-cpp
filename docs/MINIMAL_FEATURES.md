@@ -130,7 +130,7 @@ websocket transport are *not* part of the core and are out of scope.)
 - Rich-text formatting attributes and embeds (`ContentFormat`,
   `ContentEmbed`): decoded and preserved on the wire, no API.
 - Undo manager, snapshots, relative positions.
-- Observers/events, transactions with origin tracking.
+- Deep (subtree) observers (`observeDeep`).
 - Awareness protocol and any network transport (sync is byte-array in/out;
   the demo exchanges base64 blobs).
 
@@ -143,6 +143,14 @@ Implemented since 0.2 (was out of scope in 0.1):
   keep their type ref and are not replaced with `GC` structs (equivalent to a
   yjs doc with `gc: false` for type nodes); GC structs from peers are still
   accepted.
+
+Implemented since 0.4 (was out of scope in 0.1):
+
+- Transactions (`doc.transact`, implicit per-mutation transactions, origin
+  tags) and observers: yjs `YEvent.changes` list deltas and `YEvent.keys`
+  map-key changes, computed at transaction cleanup before garbage
+  collection/merging (which now runs at end of transaction, as in yjs), plus
+  doc-level update events (`writeUpdateMessageFromTransaction` equivalent).
 
 Implemented since 0.3 (was out of scope in 0.1):
 

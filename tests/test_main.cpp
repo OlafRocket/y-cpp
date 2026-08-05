@@ -462,6 +462,163 @@ TEST(map_fuzz_converges) {
   }
 }
 
+// ------------------------------------------------------ transactions/events
+
+TEST(observer_text_delta) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  std::vector<ycpp::Event> events;
+  t.observe([&](const ycpp::Event& e) { events.push_back(e); });
+  t.insert(0, "hello");
+  checkEq(events.size(), size_t(1), "one event per transaction");
+  checkEq(events[0].delta.size(), size_t(1), "single insert op");
+  check(events[0].delta[0].kind == ycpp::DeltaOp::Kind::Insert, "insert kind");
+  checkEq(ycpp::utf::utf16To8(events[0].delta[0].str), std::string("hello"), "inserted text");
+  check(events[0].local, "local event");
+
+  events.clear();
+  t.insert(2, "XX");
+  checkEq(events[0].delta.size(), size_t(2), "retain + insert");
+  check(events[0].delta[0].kind == ycpp::DeltaOp::Kind::Retain &&
+            events[0].delta[0].length == 2,
+        "retain 2");
+  checkEq(ycpp::utf::utf16To8(events[0].delta[1].str), std::string("XX"), "insert XX");
+
+  events.clear();
+  t.remove(1, 3);
+  checkEq(events[0].delta.size(), size_t(2), "retain + delete");
+  check(events[0].delta[1].kind == ycpp::DeltaOp::Kind::Delete &&
+            events[0].delta[1].length == 3,
+        "delete 3");
+}
+
+TEST(observer_transact_batches) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  int fired = 0;
+  std::vector<ycpp::DeltaOp> lastDelta;
+  t.observe([&](const ycpp::Event& e) {
+    fired++;
+    lastDelta = e.delta;
+  });
+  d.transact([&] {
+    t.insert(0, "abc");
+    t.insert(3, "def");
+    t.remove(0, 1);
+  }, "batch-origin");
+  checkEq(fired, 1, "one event for the whole transaction");
+  // Net effect: "bcdef" inserted at 0.
+  checkEq(lastDelta.size(), size_t(1), "coalesced ops");
+  checkEq(ycpp::utf::utf16To8(lastDelta[0].str), std::string("bcdef"), "net insert");
+}
+
+TEST(observer_insert_and_delete_same_tx_invisible) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  t.insert(0, "base");
+  int fired = 0;
+  ycpp::Event last;
+  t.observe([&](const ycpp::Event& e) { fired++; last = e; });
+  d.transact([&] {
+    t.insert(4, "temp");
+    t.remove(4, 4);
+  });
+  checkEq(fired, 1, "event fires");
+  check(last.delta.empty(), "add+delete within tx is invisible in the delta");
+}
+
+TEST(observer_array_delta) {
+  ycpp::Doc d(1);
+  auto arr = d.getArray("a");
+  std::vector<ycpp::Event> events;
+  arr.observe([&](const ycpp::Event& e) { events.push_back(e); });
+  arr.insert(0, {ycpp::Any::of(int64_t{1}), ycpp::Any::of("two")});
+  checkEq(events.size(), size_t(1), "insert event");
+  checkEq(events[0].delta[0].values.size(), size_t(2), "two inserted values");
+  checkEq(events[0].delta[0].values[1].any.str, std::string("two"), "value content");
+  events.clear();
+  arr.remove(0, 1);
+  check(events[0].delta[0].kind == ycpp::DeltaOp::Kind::Delete, "delete op");
+}
+
+TEST(observer_map_keys) {
+  ycpp::Doc d(1);
+  auto m = d.getMap("m");
+  std::vector<ycpp::Event> events;
+  m.observe([&](const ycpp::Event& e) { events.push_back(e); });
+
+  m.set("k", ycpp::Any::of(int64_t{1}));
+  check(events.back().keys.at("k").action == ycpp::MapChange::Action::Add, "add action");
+  check(!events.back().keys.at("k").oldValue.has_value(), "no old value on add");
+
+  m.set("k", ycpp::Any::of(int64_t{2}));
+  check(events.back().keys.at("k").action == ycpp::MapChange::Action::Update, "update action");
+  checkEq(events.back().keys.at("k").oldValue->any.integer, int64_t{1}, "old value on update");
+
+  m.remove("k");
+  check(events.back().keys.at("k").action == ycpp::MapChange::Action::Delete, "delete action");
+  checkEq(events.back().keys.at("k").oldValue->any.integer, int64_t{2}, "old value on delete");
+  checkEq(events.size(), size_t(3), "three events");
+}
+
+TEST(observer_remote_and_origin) {
+  ycpp::Doc a(1), b(2);
+  auto tb = b.getText();
+  std::vector<ycpp::Event> events;
+  tb.observe([&](const ycpp::Event& e) { events.push_back(e); });
+  a.getText().insert(0, "from a");
+  b.applyUpdate(a.encodeStateAsUpdate(b.encodeStateVector()), "network");
+  checkEq(events.size(), size_t(1), "remote change fires observer");
+  check(!events[0].local, "remote event is not local");
+  checkEq(events[0].origin, std::string("network"), "origin passed through");
+  checkEq(ycpp::utf::utf16To8(events[0].delta[0].str), std::string("from a"), "remote delta");
+}
+
+TEST(observer_unobserve) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  int fired = 0;
+  uint64_t h = t.observe([&](const ycpp::Event&) { fired++; });
+  t.insert(0, "x");
+  t.unobserve(h);
+  t.insert(0, "y");
+  checkEq(fired, 1, "no events after unobserve");
+}
+
+TEST(on_update_event) {
+  ycpp::Doc a(1);
+  std::vector<std::vector<uint8_t>> updates;
+  std::vector<std::string> origins;
+  a.onUpdate([&](const std::vector<uint8_t>& u, const std::string& o) {
+    updates.push_back(u);
+    origins.push_back(o);
+  });
+  a.transact([&] { a.getText().insert(0, "hello"); }, "edit-1");
+  a.getText().insert(5, " world");
+  a.getText().remove(0, 1);
+  checkEq(updates.size(), size_t(3), "one update per transaction");
+  checkEq(origins[0], std::string("edit-1"), "origin on update handler");
+  // Replaying the incremental updates reproduces the document.
+  ycpp::Doc b(2);
+  for (const auto& u : updates) b.applyUpdate(u);
+  checkEq(b.getText().toString(), a.getText().toString(), "updates replay to same doc");
+  check(!b.hasPending(), "replay complete");
+}
+
+TEST(on_update_covers_remote_applies) {
+  // A relay can re-broadcast what applyUpdate produced.
+  ycpp::Doc a(1), relay(2), c(3);
+  std::vector<std::vector<uint8_t>> rebroadcast;
+  relay.onUpdate([&](const std::vector<uint8_t>& u, const std::string&) {
+    rebroadcast.push_back(u);
+  });
+  a.getText().insert(0, "via relay");
+  relay.applyUpdate(a.encodeStateAsUpdate(), "remote");
+  checkEq(rebroadcast.size(), size_t(1), "relay update fired");
+  for (const auto& u : rebroadcast) c.applyUpdate(u);
+  checkEq(c.getText().toString(), std::string("via relay"), "relayed content");
+}
+
 // ----------------------------------------------------------- compaction
 
 TEST(compaction_sequential_typing) {
