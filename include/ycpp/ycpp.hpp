@@ -144,8 +144,10 @@ class Array;
 class Map;
 
 // RAII observer registration: detaches automatically when destroyed (like
-// boost::signals2::scoped_connection). Movable, not copyable. Must not
-// outlive the Doc it was created from.
+// boost::signals2::scoped_connection). Movable, not copyable. Tracks the
+// Doc's lifetime through a weak liveness token, so a Subscription that
+// outlives its Doc detaches into a safe no-op instead of touching freed
+// memory.
 class Subscription {
  public:
   Subscription() = default;
@@ -158,16 +160,19 @@ class Subscription {
       type_ = o.type_;
       doc_ = o.doc_;
       handle_ = o.handle_;
+      alive_ = std::move(o.alive_);
       o.type_ = nullptr;
       o.doc_ = nullptr;
       o.handle_ = 0;
+      o.alive_.reset();
     }
     return *this;
   }
   ~Subscription() { reset(); }
 
-  void reset();  // detach now (idempotent)
-  bool active() const { return handle_ != 0; }
+  void reset();  // detach now (idempotent, safe after the Doc is gone)
+  // True while attached and the Doc is still alive.
+  bool active() const { return handle_ != 0 && !alive_.expired(); }
 
  private:
   friend class TypeRef;
@@ -175,6 +180,7 @@ class Subscription {
   YType* type_ = nullptr;  // set for type observers
   Doc* doc_ = nullptr;     // set for doc update handlers
   uint64_t handle_ = 0;
+  std::weak_ptr<void> alive_;  // expires when the Doc is destroyed
 };
 
 // ------------------------------------------------------------------ wrappers
@@ -381,6 +387,8 @@ class Doc {
   int txDepth_ = 0;
   uint64_t nextHandle_ = 1;  // observer / update-handler handles
   std::vector<std::pair<uint64_t, UpdateHandler>> updateHandlers_;
+  // Liveness token for Subscriptions: expires with the Doc.
+  std::shared_ptr<void> aliveToken_ = std::make_shared<int>(0);
 };
 
 }  // namespace ycpp

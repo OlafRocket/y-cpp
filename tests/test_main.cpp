@@ -624,6 +624,23 @@ TEST(subscription_raii) {
   checkEq(updates, 1, "update subscription auto-detached");
 }
 
+TEST(subscription_survives_doc_destruction) {
+  // A Subscription outliving its Doc must detach into a safe no-op.
+  ycpp::Subscription sub, usub;
+  {
+    ycpp::Doc d(1);
+    sub = d.getText().subscribe([](const ycpp::Event&) {});
+    usub = d.subscribeUpdates([](const std::vector<uint8_t>&, const std::string&) {});
+    check(sub.active() && usub.active(), "active while doc alive");
+  }
+  check(!sub.active() && !usub.active(), "inactive after doc destruction");
+  sub.reset();   // must not touch freed memory
+  usub.reset();
+  ycpp::Subscription moved = std::move(sub);  // moves of dead subs are safe too
+  moved.reset();
+  check(true, "reset after doc death is a no-op");
+}
+
 TEST(on_update_event) {
   ycpp::Doc a(1);
   std::vector<std::vector<uint8_t>> updates;

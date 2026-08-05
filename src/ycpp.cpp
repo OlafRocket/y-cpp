@@ -1183,20 +1183,26 @@ void Doc::offUpdate(uint64_t handle) {
 }
 
 void Subscription::reset() {
-  if (type_ != nullptr) {
-    TypeRef(type_).unobserve(handle_);
-  } else if (doc_ != nullptr) {
-    doc_->offUpdate(handle_);
+  // Only touch the doc's structures while its liveness token still exists;
+  // if the Doc died first, there is nothing left to detach from.
+  if (auto alive = alive_.lock()) {
+    if (type_ != nullptr) {
+      TypeRef(type_).unobserve(handle_);
+    } else if (doc_ != nullptr) {
+      doc_->offUpdate(handle_);
+    }
   }
   type_ = nullptr;
   doc_ = nullptr;
   handle_ = 0;
+  alive_.reset();
 }
 
 Subscription TypeRef::subscribe(Observer fn) {
   Subscription sub;
   sub.type_ = t_;
   sub.handle_ = observe(std::move(fn));
+  sub.alive_ = t_->doc->aliveToken_;
   return sub;
 }
 
@@ -1204,6 +1210,7 @@ Subscription Doc::subscribeUpdates(UpdateHandler fn) {
   Subscription sub;
   sub.doc_ = this;
   sub.handle_ = onUpdate(std::move(fn));
+  sub.alive_ = aliveToken_;
   return sub;
 }
 
