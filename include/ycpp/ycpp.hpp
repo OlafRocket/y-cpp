@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "ycpp/any.hpp"
@@ -94,6 +95,18 @@ struct Event {
 using Observer = std::function<void(const Event&)>;
 
 struct Item {
+  // Boxed payload for the opaque content kinds (Embed/Format/Doc): they are
+  // rare, so keeping them behind a pointer keeps every Item small.
+  struct Opaque {
+    std::string key;  // Format attribute key / Doc guid
+    std::string raw;  // raw JSON payload (Embed/Format)
+    Any any;          // Doc options
+  };
+  // Content storage: the alternative must match `kind` (accessors throw
+  // std::bad_variant_access on mismatch). monostate covers GC/Deleted.
+  using Content = std::variant<std::monostate, std::u16string, std::vector<Any>,
+                               std::vector<uint8_t>, YType*, std::unique_ptr<Opaque>>;
+
   ID id;
   uint64_t len = 0;
   std::optional<ID> origin;       // ID of item to the left at insertion time
@@ -105,11 +118,7 @@ struct Item {
   std::optional<ID> parentId;             // parent addressed by item ID, from decode
   std::optional<std::string> parentSub;   // map key (Y.Map entries)
   ContentKind kind = ContentKind::String;
-  std::u16string str;          // String content
-  std::vector<Any> anyVals;    // Any content; also JSON/Embed/Doc raw payloads
-  std::vector<uint8_t> bin;    // Binary content
-  std::string key;             // Format attribute key / Doc guid
-  YType* typeContent = nullptr;  // Type content
+  Content content;
   bool deleted = false;
   bool integrated = false;
 
@@ -124,6 +133,19 @@ struct Item {
         return false;
     }
   }
+
+  std::u16string& str() { return std::get<std::u16string>(content); }
+  const std::u16string& str() const { return std::get<std::u16string>(content); }
+  std::vector<Any>& anyVals() { return std::get<std::vector<Any>>(content); }
+  const std::vector<Any>& anyVals() const { return std::get<std::vector<Any>>(content); }
+  std::vector<uint8_t>& bin() { return std::get<std::vector<uint8_t>>(content); }
+  const std::vector<uint8_t>& bin() const { return std::get<std::vector<uint8_t>>(content); }
+  YType* typeContent() const {
+    auto* p = std::get_if<YType*>(&content);
+    return p == nullptr ? nullptr : *p;
+  }
+  Opaque& opaque() { return *std::get<std::unique_ptr<Opaque>>(content); }
+  const Opaque& opaque() const { return *std::get<std::unique_ptr<Opaque>>(content); }
 };
 
 // A shared type node (yjs AbstractType): a linked list of items (_start) for

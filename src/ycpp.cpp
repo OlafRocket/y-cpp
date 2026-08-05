@@ -57,15 +57,15 @@ size_t findIndex(const std::vector<Item*>& v, uint64_t clock) {
 void spliceContentLeft(Item* it, uint64_t offset) {
   switch (it->kind) {
     case ContentKind::String:
-      it->str.erase(0, offset);
-      if (!it->str.empty() && it->str[0] >= 0xDC00 && it->str[0] <= 0xDFFF) {
-        it->str[0] = 0xFFFD;  // split surrogate pair, same as yjs ContentString
+      it->str().erase(0, offset);
+      if (!it->str().empty() && it->str()[0] >= 0xDC00 && it->str()[0] <= 0xDFFF) {
+        it->str()[0] = 0xFFFD;  // split surrogate pair, same as yjs ContentString
       }
       break;
     case ContentKind::Any:
     case ContentKind::JSON:
-      it->anyVals.erase(it->anyVals.begin(),
-                        it->anyVals.begin() + static_cast<long>(offset));
+      it->anyVals().erase(it->anyVals().begin(),
+                        it->anyVals().begin() + static_cast<long>(offset));
       break;
     case ContentKind::Deleted:
       break;
@@ -91,18 +91,20 @@ std::map<uint64_t, uint64_t> decodeStateVector(std::span<const uint8_t> bytes) {
 Value valueAt(const Item* it, uint64_t idx) {
   Value v;
   switch (it->kind) {
-    case ContentKind::Type: v.type = it->typeContent; break;
+    case ContentKind::Type: v.type = it->typeContent(); break;
     case ContentKind::Any:
     case ContentKind::JSON:
-      v.any = it->anyVals[idx];
+      v.any = it->anyVals()[idx];
       break;
     case ContentKind::Embed:
-    case ContentKind::Doc:
-      v.any = it->anyVals.empty() ? Any() : it->anyVals[0];
+      v.any = Any::of(it->opaque().raw);
       break;
-    case ContentKind::Binary: v.any = Any::binary(it->bin); break;
+    case ContentKind::Doc:
+      v.any = it->opaque().any;
+      break;
+    case ContentKind::Binary: v.any = Any::binary(it->bin()); break;
     case ContentKind::String:
-      v.any = Any::of(utf::utf16To8(it->str.substr(idx, 1)));
+      v.any = Any::of(utf::utf16To8(it->str().substr(idx, 1)));
       break;
     default: break;
   }
@@ -190,10 +192,10 @@ void Doc::validate() const {
            it->kind == ContentKind::Binary)) {
         fail("deleted item content not garbage-collected");
       }
-      if (!it->deleted && it->kind == ContentKind::String && it->len != it->str.size()) {
+      if (!it->deleted && it->kind == ContentKind::String && it->len != it->str().size()) {
         fail("string item length mismatch");
       }
-      if (!it->deleted && it->kind == ContentKind::Any && it->len != it->anyVals.size()) {
+      if (!it->deleted && it->kind == ContentKind::Any && it->len != it->anyVals().size()) {
         fail("any item length mismatch");
       }
       clock = it->id.clock + it->len;
@@ -280,18 +282,19 @@ Item* Doc::splitItem(Item* it, uint64_t diff) {
   r->len = it->len - diff;
   switch (it->kind) {
     case ContentKind::String:
-      r->str = it->str.substr(diff);
-      it->str.resize(diff);
+      r->content = it->str().substr(diff);
+      it->str().resize(diff);
       // Splitting inside a surrogate pair produces two U+FFFD, same as yjs.
-      if (!it->str.empty() && it->str.back() >= 0xD800 && it->str.back() <= 0xDBFF) {
-        it->str.back() = 0xFFFD;
-        r->str[0] = 0xFFFD;
+      if (!it->str().empty() && it->str().back() >= 0xD800 && it->str().back() <= 0xDBFF) {
+        it->str().back() = 0xFFFD;
+        r->str()[0] = 0xFFFD;
       }
       break;
     case ContentKind::Any:
     case ContentKind::JSON:
-      r->anyVals.assign(it->anyVals.begin() + static_cast<long>(diff), it->anyVals.end());
-      it->anyVals.resize(diff);
+      r->content = std::vector<Any>(it->anyVals().begin() + static_cast<long>(diff),
+                                    it->anyVals().end());
+      it->anyVals().resize(diff);
       break;
     case ContentKind::Deleted:
       break;
@@ -339,13 +342,13 @@ void Doc::deleteItem(Item* s) {
   // record the deletion and the changed type on the transaction.
   if (tx_) tx_->ds[s->id.client].push_back(DeleteRange{s->id.clock, s->len});
   if (s->parent) addChangedType(s->parent, s->parentSub);
-  if (s->kind == ContentKind::Type && s->typeContent) {
+  if (s->kind == ContentKind::Type && s->typeContent()) {
     // ContentType.delete: the whole subtree dies with its container. The
     // type ref itself is kept (we do not convert children to GC structs).
-    for (Item* c = s->typeContent->start; c != nullptr; c = c->right) {
+    for (Item* c = s->typeContent()->start; c != nullptr; c = c->right) {
       if (!c->deleted) deleteItem(c);
     }
-    for (auto& [k, item] : s->typeContent->map) {
+    for (auto& [k, item] : s->typeContent()->map) {
       if (!item->deleted) deleteItem(item);
     }
   }
@@ -371,9 +374,9 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
     if (!r->origin || !(*r->origin == l->lastId())) return false;
     if (!sameOpt(l->rightOrigin, r->rightOrigin)) return false;
   }
-  if (l->kind == ContentKind::String) l->str += r->str;
+  if (l->kind == ContentKind::String) l->str() += r->str();
   if (l->kind == ContentKind::Any || l->kind == ContentKind::JSON) {
-    l->anyVals.insert(l->anyVals.end(), r->anyVals.begin(), r->anyVals.end());
+    l->anyVals().insert(l->anyVals().end(), r->anyVals().begin(), r->anyVals().end());
   }
   l->len += r->len;
   if (l->kind != ContentKind::GC) {
@@ -415,10 +418,7 @@ void Doc::integrateAsGc(Item* it, uint64_t offset) {
   it->len -= offset;
   it->kind = ContentKind::GC;
   it->deleted = true;
-  it->str.clear();
-  it->anyVals.clear();
-  it->bin.clear();
-  it->typeContent = nullptr;
+  it->content = std::monostate{};
   it->left = it->right = nullptr;
   addStruct(it);
 }
@@ -450,8 +450,8 @@ void Doc::integrate(Item* it, uint64_t offset) {
       it->parent = rootType(*it->parentName, TypeKind::Unknown);
     } else if (it->parentId) {
       Item* p = getItem(*it->parentId);
-      if (p->kind == ContentKind::Type && p->typeContent) {
-        it->parent = p->typeContent;
+      if (p->kind == ContentKind::Type && p->typeContent()) {
+        it->parent = p->typeContent();
       } else {
         // Parent item was garbage-collected: integrate as GC (yjs getMissing).
         integrateAsGc(it, offset);
@@ -660,29 +660,34 @@ void Doc::applyUpdate(std::span<const uint8_t> update, const std::string& origin
           case 2: {  // ContentJSON (legacy): kept as raw JSON strings
             it->kind = ContentKind::JSON;
             uint64_t n = dec.readVarUint();
-            for (uint64_t k = 0; k < n; k++) it->anyVals.push_back(Any::of(dec.readVarString()));
+            std::vector<Any> vals;
+            vals.reserve(n);
+            for (uint64_t k = 0; k < n; k++) vals.push_back(Any::of(dec.readVarString()));
+            it->content = std::move(vals);
             it->len = n;
             break;
           }
           case 3:  // ContentBinary
             it->kind = ContentKind::Binary;
-            it->bin = dec.readBytes(dec.readVarUint());
+            it->content = dec.readBytes(dec.readVarUint());
             it->len = 1;
             break;
           case 4:  // ContentString
             it->kind = ContentKind::String;
-            it->str = utf::utf8To16(dec.readVarString());
-            it->len = it->str.size();
+            it->content = utf::utf8To16(dec.readVarString());
+            it->len = it->str().size();
             break;
           case 5:  // ContentEmbed: raw JSON, opaque
             it->kind = ContentKind::Embed;
-            it->anyVals.push_back(Any::of(dec.readVarString()));
+            it->content = std::make_unique<Item::Opaque>();
+            it->opaque().raw = dec.readVarString();
             it->len = 1;
             break;
           case 6:  // ContentFormat: attribute key + raw JSON value, opaque
             it->kind = ContentKind::Format;
-            it->key = dec.readVarString();
-            it->anyVals.push_back(Any::of(dec.readVarString()));
+            it->content = std::make_unique<Item::Opaque>();
+            it->opaque().key = dec.readVarString();
+            it->opaque().raw = dec.readVarString();
             it->len = 1;
             break;
           case 7: {  // ContentType
@@ -694,22 +699,25 @@ void Doc::applyUpdate(std::span<const uint8_t> update, const std::string& origin
             YType* t = allocType(static_cast<TypeKind>(typeRef));
             if (typeRef == 3 || typeRef == 5) t->xmlName = dec.readVarString();
             t->item = it;
-            it->typeContent = t;
+            it->content = t;
             it->len = 1;
             break;
           }
           case 8: {  // ContentAny
             it->kind = ContentKind::Any;
             uint64_t n = dec.readVarUint();
-            it->anyVals.reserve(n);
-            for (uint64_t k = 0; k < n; k++) it->anyVals.push_back(anycodec::read(dec));
+            std::vector<Any> vals;
+            vals.reserve(n);
+            for (uint64_t k = 0; k < n; k++) vals.push_back(anycodec::read(dec));
+            it->content = std::move(vals);
             it->len = n;
             break;
           }
           case 9:  // ContentDoc (subdocument): preserved, no subdoc semantics
             it->kind = ContentKind::Doc;
-            it->key = dec.readVarString();  // guid
-            it->anyVals.push_back(anycodec::read(dec));
+            it->content = std::make_unique<Item::Opaque>();
+            it->opaque().key = dec.readVarString();  // guid
+            it->opaque().any = anycodec::read(dec);
             it->len = 1;
             break;
           default:
@@ -806,40 +814,40 @@ void Doc::writeStruct(lib0::Encoder& enc, const Item* it, uint64_t offset) const
       break;
     case ContentKind::JSON:
       enc.writeVarUint(it->len - offset);
-      for (uint64_t i = offset; i < it->anyVals.size(); i++) {
-        enc.writeVarString(it->anyVals[i].str());
+      for (uint64_t i = offset; i < it->anyVals().size(); i++) {
+        enc.writeVarString(it->anyVals()[i].str());
       }
       break;
     case ContentKind::Binary:
-      enc.writeVarUint(it->bin.size());
-      enc.writeBytes(it->bin);
+      enc.writeVarUint(it->bin().size());
+      enc.writeBytes(it->bin());
       break;
     case ContentKind::String:
-      enc.writeVarString(utf::utf16To8(it->str.substr(offset)));
+      enc.writeVarString(utf::utf16To8(it->str().substr(offset)));
       break;
     case ContentKind::Embed:
-      enc.writeVarString(it->anyVals[0].str());
+      enc.writeVarString(it->opaque().raw);
       break;
     case ContentKind::Format:
-      enc.writeVarString(it->key);
-      enc.writeVarString(it->anyVals[0].str());
+      enc.writeVarString(it->opaque().key);
+      enc.writeVarString(it->opaque().raw);
       break;
     case ContentKind::Type: {
-      TypeKind k = it->typeContent ? it->typeContent->kind : TypeKind::Unknown;
+      TypeKind k = it->typeContent() ? it->typeContent()->kind : TypeKind::Unknown;
       if (k == TypeKind::Unknown) throw std::runtime_error("ycpp: cannot encode untyped ContentType");
       enc.writeVarUint(static_cast<uint8_t>(k));
       if (k == TypeKind::XmlElement || k == TypeKind::XmlHook) {
-        enc.writeVarString(it->typeContent->xmlName);
+        enc.writeVarString(it->typeContent()->xmlName);
       }
       break;
     }
     case ContentKind::Any:
       enc.writeVarUint(it->len - offset);
-      for (uint64_t i = offset; i < it->anyVals.size(); i++) anycodec::write(enc, it->anyVals[i]);
+      for (uint64_t i = offset; i < it->anyVals().size(); i++) anycodec::write(enc, it->anyVals()[i]);
       break;
     case ContentKind::Doc:
-      enc.writeVarString(it->key);
-      anycodec::write(enc, it->anyVals[0]);
+      enc.writeVarString(it->opaque().key);
+      anycodec::write(enc, it->opaque().any);
       break;
     default:
       throw std::runtime_error("ycpp: cannot encode content kind");
@@ -1077,7 +1085,7 @@ void Doc::buildDelta(const Transaction& tx, const YType* t, Event& ev) const {
       begin(DeltaOp::Kind::Insert);
       cur.length += item->len;
       if (item->kind == ContentKind::String) {
-        cur.str += item->str;
+        cur.str += item->str();
       } else {
         for (uint64_t i = 0; i < item->len; i++) cur.values.push_back(valueAt(item, i));
       }
@@ -1202,18 +1210,9 @@ void Doc::cleanupTransaction(Transaction& tx) {
         if (!s->deleted) continue;
         switch (s->kind) {
           case ContentKind::String:
-            s->str.clear();
-            s->str.shrink_to_fit();
-            s->kind = ContentKind::Deleted;
-            break;
           case ContentKind::Any:
-            s->anyVals.clear();
-            s->anyVals.shrink_to_fit();
-            s->kind = ContentKind::Deleted;
-            break;
           case ContentKind::Binary:
-            s->bin.clear();
-            s->bin.shrink_to_fit();
+            s->content = std::monostate{};
             s->kind = ContentKind::Deleted;
             break;
           default:
@@ -1401,7 +1400,7 @@ void Text::insertUtf16(uint64_t index, const std::u16string& s) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::String;
-  it->str = s;
+  it->content = s;
   it->len = s.size();
   d->listInsert(t_, index, it);
 }
@@ -1414,7 +1413,7 @@ std::u16string Text::toUtf16() const {
   std::u16string out;
   out.reserve(t_->length);
   for (const Item* it = t_->start; it != nullptr; it = it->right) {
-    if (!it->deleted && it->kind == ContentKind::String) out += it->str;
+    if (!it->deleted && it->kind == ContentKind::String) out += it->str();
   }
   return out;
 }
@@ -1430,7 +1429,7 @@ void Array::insert(uint64_t index, const std::vector<Any>& values) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Any;
-  it->anyVals = values;
+  it->content = values;
   it->len = values.size();
   d->listInsert(t_, index, it);
 }
@@ -1452,33 +1451,36 @@ Array Array::insertArray(uint64_t index) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Array);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Array);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->listInsert(t_, index, it);
-  return Array(it->typeContent);
+  return Array(nested);
 }
 
 Map Array::insertMap(uint64_t index) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Map);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Map);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->listInsert(t_, index, it);
-  return Map(it->typeContent);
+  return Map(nested);
 }
 
 Text Array::insertText(uint64_t index) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Text);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Text);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->listInsert(t_, index, it);
-  return Text(it->typeContent);
+  return Text(nested);
 }
 
 std::string Array::toJson() const {
@@ -1493,7 +1495,7 @@ void Map::set(const std::string& key, const Any& value) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Any;
-  it->anyVals = {value};
+  it->content = std::vector<Any>{value};
   it->len = 1;
   d->mapSet(t_, key, it);
 }
@@ -1532,33 +1534,36 @@ Array Map::setArray(const std::string& key) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Array);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Array);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->mapSet(t_, key, it);
-  return Array(it->typeContent);
+  return Array(nested);
 }
 
 Map Map::setMap(const std::string& key) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Map);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Map);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->mapSet(t_, key, it);
-  return Map(it->typeContent);
+  return Map(nested);
 }
 
 Text Map::setText(const std::string& key) {
   Doc* d = t_->doc;
   Item* it = d->alloc();
   it->kind = ContentKind::Type;
-  it->typeContent = d->allocType(TypeKind::Text);
-  it->typeContent->item = it;
+  YType* nested = d->allocType(TypeKind::Text);
+  nested->item = it;
+  it->content = nested;
   it->len = 1;
   d->mapSet(t_, key, it);
-  return Text(it->typeContent);
+  return Text(nested);
 }
 
 std::string Map::toJson() const {
