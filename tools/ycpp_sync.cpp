@@ -33,6 +33,8 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 
+#include "ycpp/protocols/awareness.hpp"
+#include "ycpp/protocols/sync.hpp"
 #include "ycpp/utf.hpp"
 #include "ycpp/ycpp.hpp"
 
@@ -57,9 +59,16 @@ std::string toPayload(const std::vector<uint8_t>& v) {
 
 // ------------------------------------------------------------- shared doc
 
+// y-websocket message envelope (one varUint in front of every message).
+constexpr uint64_t kMessageSync = 0;
+constexpr uint64_t kMessageAwareness = 1;
+constexpr uint64_t kMessageAuth = 2;
+constexpr uint64_t kMessageQueryAwareness = 3;
+
 struct SharedDoc {
   std::mutex mu;
   ycpp::Doc doc;
+  ycpp::protocols::Awareness awareness{doc.clientId()};
   std::string docFile;
 
   void load() {
@@ -131,22 +140,17 @@ class Editor {
 
   void markDirty() { dirty_ = true; }
 
-  // Keep the cursor near its logical position across a remote change.
-  // Call with sd_.mu held.
-  void adjustCursorLocked(const std::u16string& before, const std::u16string& after) {
-    uint64_t p = 0;
-    while (p < before.size() && p < after.size() && before[p] == after[p]) p++;
-    uint64_t sfx = 0;
-    while (sfx < before.size() - p && sfx < after.size() - p &&
-           before[before.size() - 1 - sfx] == after[after.size() - 1 - sfx]) {
-      sfx++;
-    }
-    if (cursor_ <= p) {
-      // unchanged region before the cursor: keep position
-    } else if (cursor_ >= before.size() - sfx) {
-      cursor_ = after.size() - (before.size() - cursor_);
+  // Cursor preservation across remote changes, via relative positions:
+  // capture before applying a remote update, restore after. Call with
+  // sd_.mu held.
+  ycpp::RelativePosition captureCursorLocked() {
+    return ycpp::createRelativePosition(sd_.doc.getText(), cursor_);
+  }
+  void restoreCursorLocked(const ycpp::RelativePosition& rel) {
+    if (auto abs = ycpp::resolveRelativePosition(rel, sd_.doc)) {
+      cursor_ = abs->index;
     } else {
-      cursor_ = std::min<uint64_t>(p, after.size());
+      cursor_ = std::min<uint64_t>(cursor_, sd_.doc.getText().length());
     }
   }
 
@@ -407,7 +411,8 @@ class Editor {
  public:
   Editor(SharedDoc&, std::string, std::function<std::string()>) {}
   void markDirty() {}
-  void adjustCursorLocked(const std::u16string&, const std::u16string&) {}
+  ycpp::RelativePosition captureCursorLocked() { return {}; }
+  void restoreCursorLocked(const ycpp::RelativePosition&) {}
   void run() { runHeadlessWait(); }
   static void runHeadlessWait() {
     while (!gQuit) std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -456,43 +461,113 @@ int runServe(const Options& opts) {
   SharedDoc sd;
   sd.docFile = opts.doc;
   sd.load();
+  // A y-websocket server exposes no state of its own.
+  sd.awareness.setLocalState(std::nullopt);
 
   std::string webDir = findWebDir(opts.web);
   ix::HttpServer server(opts.port, opts.host);
 
   std::unique_ptr<Editor> editor;
+  // Which awareness client ids arrived through which connection (so a closed
+  // connection removes exactly its clients). Guarded by sd.mu.
+  std::map<std::string, std::set<uint64_t>> connClients;
 
-  // WebSocket side: full state on connect, then relay updates.
-  server.setOnClientMessageCallback([&](std::shared_ptr<ix::ConnectionState>,
+  auto sendTo = [](ix::WebSocket& ws, const ycpp::lib0::Encoder& enc) {
+    ws.sendBinary(toPayload(enc.bytes()));
+  };
+  auto broadcast = [&server](const ycpp::lib0::Encoder& enc) {
+    std::string payload = toPayload(enc.bytes());
+    for (const auto& client : server.getClients()) client->sendBinary(payload);
+  };
+
+  // Every document transaction goes out as a sync Update message (local edits
+  // and applied remote updates alike, as the y-websocket server does).
+  sd.doc.onUpdate([&](const std::vector<uint8_t>& update, const std::string&) {
+    ycpp::lib0::Encoder enc;
+    enc.writeVarUint(kMessageSync);
+    ycpp::protocols::sync::writeUpdate(enc, update);
+    broadcast(enc);
+  });
+
+  // Awareness changes fan out to everyone; track per-connection client ids.
+  sd.awareness.onUpdate([&](const ycpp::protocols::Awareness::Change& c) {
+    std::vector<uint64_t> changed;
+    changed.insert(changed.end(), c.added.begin(), c.added.end());
+    changed.insert(changed.end(), c.updated.begin(), c.updated.end());
+    changed.insert(changed.end(), c.removed.begin(), c.removed.end());
+    if (c.origin.rfind("conn:", 0) == 0) {
+      auto& owned = connClients[c.origin];
+      for (uint64_t cl : c.added) owned.insert(cl);
+      for (uint64_t cl : c.updated) owned.insert(cl);
+      for (uint64_t cl : c.removed) owned.erase(cl);
+    }
+    ycpp::lib0::Encoder enc;
+    enc.writeVarUint(kMessageAwareness);
+    enc.writeVarUint8Array(sd.awareness.encodeUpdate(changed));
+    broadcast(enc);
+  });
+
+  server.setOnClientMessageCallback([&](std::shared_ptr<ix::ConnectionState> state,
                                         ix::WebSocket& ws,
                                         const ix::WebSocketMessagePtr& msg) {
+    std::string connId = "conn:" + state->getId();
     if (msg->type == ix::WebSocketMessageType::Open) {
-      std::string payload;
-      {
-        std::lock_guard<std::mutex> lk(sd.mu);
-        payload = toPayload(sd.doc.encodeStateAsUpdate());
+      std::lock_guard<std::mutex> lk(sd.mu);
+      ycpp::lib0::Encoder enc;
+      enc.writeVarUint(kMessageSync);
+      ycpp::protocols::sync::writeSyncStep1(enc, sd.doc);
+      sendTo(ws, enc);
+      if (!sd.awareness.getStates().empty()) {
+        ycpp::lib0::Encoder aenc;
+        aenc.writeVarUint(kMessageAwareness);
+        aenc.writeVarUint8Array(sd.awareness.encodeAllStates());
+        sendTo(ws, aenc);
       }
-      ws.sendBinary(payload);
       if (editor) editor->markDirty();
       if (opts.headless) std::cout << "peer connected" << std::endl;
     } else if (msg->type == ix::WebSocketMessageType::Message && msg->binary) {
-      {
-        std::lock_guard<std::mutex> lk(sd.mu);
-        std::u16string before = sd.doc.getText().toUtf16();
-        try {
-          sd.doc.applyUpdate(asBytes(msg->str), "remote");
-        } catch (const std::exception& e) {
-          std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
-          return;
+      std::lock_guard<std::mutex> lk(sd.mu);
+      try {
+        ycpp::lib0::Decoder dec(asBytes(msg->str));
+        switch (dec.readVarUint()) {
+          case kMessageSync: {
+            ycpp::RelativePosition cursor;
+            if (editor) cursor = editor->captureCursorLocked();
+            ycpp::lib0::Encoder reply;
+            reply.writeVarUint(kMessageSync);
+            ycpp::protocols::sync::readSyncMessage(dec, reply, sd.doc, "remote");
+            if (editor) editor->restoreCursorLocked(cursor);
+            if (reply.bytes().size() > 1) sendTo(ws, reply);
+            sd.saveLocked();
+            break;
+          }
+          case kMessageAwareness:
+            sd.awareness.applyUpdate(dec.readVarUint8Array(), connId);
+            break;
+          case kMessageQueryAwareness: {
+            ycpp::lib0::Encoder aenc;
+            aenc.writeVarUint(kMessageAwareness);
+            aenc.writeVarUint8Array(sd.awareness.encodeAllStates());
+            sendTo(ws, aenc);
+            break;
+          }
+          case kMessageAuth:
+            break;  // accepted, ignored
+          default:
+            break;
         }
-        if (editor) editor->adjustCursorLocked(before, sd.doc.getText().toUtf16());
-        sd.saveLocked();
-      }
-      for (const auto& client : server.getClients()) {
-        if (client.get() != &ws) client->sendBinary(msg->str);
+      } catch (const std::exception& e) {
+        std::cerr << "ycpp-sync: bad message ignored: " << e.what() << std::endl;
       }
       if (editor) editor->markDirty();
     } else if (msg->type == ix::WebSocketMessageType::Close) {
+      std::lock_guard<std::mutex> lk(sd.mu);
+      auto it = connClients.find(connId);
+      if (it != connClients.end()) {
+        std::vector<uint64_t> gone(it->second.begin(), it->second.end());
+        connClients.erase(it);
+        if (!gone.empty()) sd.awareness.removeStates(gone, "disconnect");
+      }
       if (editor) editor->markDirty();
       if (opts.headless) std::cout << "peer disconnected" << std::endl;
     }
@@ -509,10 +584,20 @@ int runServe(const Options& opts) {
         }
         std::ifstream f(webDir + path, std::ios::binary);
         if (!f) {
+          // y-websocket providers append the room name to the URL path;
+          // any unknown path serves the page (single-room server).
+          std::ifstream page(webDir + "/live.html", std::ios::binary);
+          if (!page) {
+            return std::make_shared<ix::HttpResponse>(
+                404, "Not Found", ix::HttpErrorCode::Ok,
+                ix::WebSocketHttpHeaders{{"Content-Type", "text/plain"}}, "not found");
+          }
+          std::stringstream body;
+          body << page.rdbuf();
           return std::make_shared<ix::HttpResponse>(
-              404, "Not Found", ix::HttpErrorCode::Ok,
-              ix::WebSocketHttpHeaders{{"Content-Type", "text/plain"}},
-              "not found");
+              200, "OK", ix::HttpErrorCode::Ok,
+              ix::WebSocketHttpHeaders{{"Content-Type", "text/html; charset=utf-8"}},
+              body.str());
         }
         std::stringstream body;
         body << f.rdbuf();
@@ -529,20 +614,24 @@ int runServe(const Options& opts) {
   }
   server.start();
   std::cout << "ycpp-sync: listening on http://localhost:" << opts.port
-            << " (WebSocket on the same port, web dir: " << webDir << ")"
-            << std::endl;
+            << " (y-websocket protocol, web dir: " << webDir << ")" << std::endl;
 
-  // Local transactions (terminal text box edits) broadcast to every peer;
-  // remote updates are relayed by the message callback above.
-  sd.doc.onUpdate([&server](const std::vector<uint8_t>& update, const std::string& origin) {
-    if (origin == "remote") return;
-    std::string payload = toPayload(update);
-    for (const auto& client : server.getClients()) client->sendBinary(payload);
+  // Awareness housekeeping (y-protocols: 30s timeout).
+  std::thread housekeeper([&] {
+    int ticks = 0;
+    while (!gQuit) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (++ticks % 6 != 0) continue;  // every 3s
+      std::lock_guard<std::mutex> lk(sd.mu);
+      sd.awareness.removeOutdated();
+    }
   });
+
   auto status = [&server, &sd]() {
     size_t peers = server.getClients().size();
     std::lock_guard<std::mutex> lk(sd.mu);
-    return std::to_string(peers) + " peer(s), " +
+    return std::to_string(peers) + " conn(s), " +
+           std::to_string(sd.awareness.getStates().size()) + " present, " +
            std::to_string(sd.doc.getText().length()) + " chars";
   };
 
@@ -554,6 +643,8 @@ int runServe(const Options& opts) {
     editor->run();
     editor.reset();
   }
+  gQuit = true;
+  housekeeper.join();
   server.stop();
   {
     std::lock_guard<std::mutex> lk(sd.mu);
@@ -566,6 +657,9 @@ int runConnect(const Options& opts) {
   SharedDoc sd;
   sd.docFile = opts.doc;
   sd.load();
+  sd.awareness.setLocalStateField(
+      "user", ycpp::Any::object({{"name", ycpp::Any::of("ycpp")},
+                                 {"color", ycpp::Any::of("#6ea8ff")}}));
 
   ix::WebSocket ws;
   ws.setUrl(opts.url);
@@ -573,27 +667,75 @@ int runConnect(const Options& opts) {
   std::unique_ptr<Editor> editor;
   std::atomic<bool> connected{false};
 
+  auto send = [&ws](const ycpp::lib0::Encoder& enc) {
+    ws.sendBinary(toPayload(enc.bytes()));
+  };
+
+  // Local document transactions go to the server as Update messages.
+  sd.doc.onUpdate([&](const std::vector<uint8_t>& update, const std::string& origin) {
+    if (origin == "remote") return;
+    ycpp::lib0::Encoder enc;
+    enc.writeVarUint(kMessageSync);
+    ycpp::protocols::sync::writeUpdate(enc, update);
+    send(enc);
+  });
+  // Local awareness changes (incl. periodic renewal) are broadcast.
+  sd.awareness.onUpdate([&](const ycpp::protocols::Awareness::Change& c) {
+    if (c.origin != "local") return;
+    ycpp::lib0::Encoder enc;
+    enc.writeVarUint(kMessageAwareness);
+    enc.writeVarUint8Array(sd.awareness.encodeUpdate({sd.awareness.clientId()}));
+    send(enc);
+  });
+
   ws.setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
     if (msg->type == ix::WebSocketMessageType::Open) {
       connected = true;
-      std::string payload;
-      {
-        std::lock_guard<std::mutex> lk(sd.mu);
-        payload = toPayload(sd.doc.encodeStateAsUpdate());
-      }
-      ws.sendBinary(payload);  // offer our state; server replies with its own
+      std::lock_guard<std::mutex> lk(sd.mu);
+      ycpp::lib0::Encoder enc;
+      enc.writeVarUint(kMessageSync);
+      ycpp::protocols::sync::writeSyncStep1(enc, sd.doc);
+      send(enc);
+      ycpp::lib0::Encoder q;
+      q.writeVarUint(kMessageQueryAwareness);
+      send(q);
+      ycpp::lib0::Encoder aenc;
+      aenc.writeVarUint(kMessageAwareness);
+      aenc.writeVarUint8Array(sd.awareness.encodeUpdate({sd.awareness.clientId()}));
+      send(aenc);
       if (editor) editor->markDirty();
     } else if (msg->type == ix::WebSocketMessageType::Message && msg->binary) {
       std::lock_guard<std::mutex> lk(sd.mu);
-      std::u16string before = sd.doc.getText().toUtf16();
       try {
-        sd.doc.applyUpdate(asBytes(msg->str), "remote");
+        ycpp::lib0::Decoder dec(asBytes(msg->str));
+        switch (dec.readVarUint()) {
+          case kMessageSync: {
+            ycpp::RelativePosition cursor;
+            if (editor) cursor = editor->captureCursorLocked();
+            ycpp::lib0::Encoder reply;
+            reply.writeVarUint(kMessageSync);
+            ycpp::protocols::sync::readSyncMessage(dec, reply, sd.doc, "remote");
+            if (editor) editor->restoreCursorLocked(cursor);
+            if (reply.bytes().size() > 1) send(reply);
+            sd.saveLocked();
+            break;
+          }
+          case kMessageAwareness:
+            sd.awareness.applyUpdate(dec.readVarUint8Array(), "remote");
+            break;
+          case kMessageQueryAwareness: {
+            ycpp::lib0::Encoder aenc;
+            aenc.writeVarUint(kMessageAwareness);
+            aenc.writeVarUint8Array(sd.awareness.encodeUpdate({sd.awareness.clientId()}));
+            send(aenc);
+            break;
+          }
+          default:
+            break;
+        }
       } catch (const std::exception& e) {
-        std::cerr << "ycpp-sync: bad update ignored: " << e.what() << std::endl;
-        return;
+        std::cerr << "ycpp-sync: bad message ignored: " << e.what() << std::endl;
       }
-      if (editor) editor->adjustCursorLocked(before, sd.doc.getText().toUtf16());
-      sd.saveLocked();
       if (editor) editor->markDirty();
     } else if (msg->type == ix::WebSocketMessageType::Close ||
                msg->type == ix::WebSocketMessageType::Error) {
@@ -603,15 +745,23 @@ int runConnect(const Options& opts) {
   });
   ws.start();  // reconnects automatically
 
-  // Local transactions are sent to the server; remote ones came from it.
-  sd.doc.onUpdate([&ws](const std::vector<uint8_t>& update, const std::string& origin) {
-    if (origin == "remote") return;
-    ws.sendBinary(toPayload(update));
+  // Keep-alive: renew the local awareness state and drop stale peers.
+  std::thread housekeeper([&] {
+    int ticks = 0;
+    while (!gQuit) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      ticks++;
+      std::lock_guard<std::mutex> lk(sd.mu);
+      if (ticks % 6 == 0) sd.awareness.removeOutdated();
+      if (ticks % 30 == 0) sd.awareness.setLocalState(sd.awareness.getLocalState());
+    }
   });
+
   auto status = [&connected, &sd]() {
     std::string s = connected ? "connected" : "connecting...";
     std::lock_guard<std::mutex> lk(sd.mu);
-    return s + ", " + std::to_string(sd.doc.getText().length()) + " chars";
+    return s + ", " + std::to_string(sd.awareness.getStates().size()) + " present, " +
+           std::to_string(sd.doc.getText().length()) + " chars";
   };
 
   if (opts.headless) {
@@ -622,6 +772,8 @@ int runConnect(const Options& opts) {
     editor->run();
     editor.reset();
   }
+  gQuit = true;
+  housekeeper.join();
   ws.stop();
   {
     std::lock_guard<std::mutex> lk(sd.mu);

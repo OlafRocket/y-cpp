@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ycpp VERSION 0.6.0 LANGUAGES CXX)
+project(ycpp VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # editor tooling (IntelliSense/clangd)
@@ -16,9 +16,15 @@ add_library(ycpp STATIC
   src/integrate.cpp
   src/store.cpp
   src/transaction.cpp
+  src/position.cpp
   src/types.cpp
   src/update_codec.cpp)
 target_include_directories(ycpp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# y-protocols port (sync + awareness): separate target, mirroring the
+# upstream yjs / y-protocols package split. The core stays protocol-pure.
+add_library(ycpp-protocols STATIC src/protocols/awareness.cpp)
+target_link_libraries(ycpp-protocols PUBLIC ycpp)
 
 add_executable(ycpp-cli tools/ycpp_cli.cpp)
 set_target_properties(ycpp-cli PROPERTIES OUTPUT_NAME ycpp)
@@ -38,7 +44,7 @@ if(YCPP_BUILD_SYNC)
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(ixwebsocket)
   add_executable(ycpp-sync tools/ycpp_sync.cpp)
-  target_link_libraries(ycpp-sync PRIVATE ycpp ixwebsocket)
+  target_link_libraries(ycpp-sync PRIVATE ycpp ycpp-protocols ixwebsocket)
   target_compile_definitions(ycpp-sync PRIVATE
     YCPP_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web")
 endif()
@@ -46,7 +52,7 @@ endif()
 enable_testing()
 
 add_executable(ycpp_tests tests/test_main.cpp)
-target_link_libraries(ycpp_tests PRIVATE ycpp)
+target_link_libraries(ycpp_tests PRIVATE ycpp ycpp-protocols)
 add_test(NAME unit COMMAND ycpp_tests)
 
 # Interop conformity tests against the real yjs (requires node + npm).

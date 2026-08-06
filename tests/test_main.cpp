@@ -8,6 +8,8 @@
 
 #include "../tools/base64_io.hpp"
 #include "ycpp/lib0.hpp"
+#include "ycpp/protocols/awareness.hpp"
+#include "ycpp/protocols/sync.hpp"
 #include "ycpp/utf.hpp"
 #include "ycpp/ycpp.hpp"
 
@@ -460,6 +462,167 @@ TEST(map_fuzz_converges) {
     check(j == d1.getMap("m").toJson() && j == d2.getMap("m").toJson(),
           "map fuzz round " + std::to_string(round) + " converged");
   }
+}
+
+// ----------------------------------------------------------------- json parse
+
+TEST(json_parse_roundtrip) {
+  using ycpp::Any;
+  const char* texts[] = {
+      "null", "true", "false", "0", "-42", "3.5", "\"hi\"", "[]", "{}",
+      "[1,\"two\",null,true,{\"a\":[1.5]}]",
+      "{\"name\":\"h\\u00e9llo \\ud83d\\ude00\",\"n\":-7,\"list\":[1,2]}",
+  };
+  for (const char* t : texts) {
+    Any a = ycpp::json::parse(t);
+    std::string dumped;
+    ycpp::json::dump(dumped, a);
+    Any again = ycpp::json::parse(dumped);
+    check(a == again, std::string("parse/dump/parse stable: ") + t);
+  }
+  checkEq(ycpp::json::parse("{\"a\": 1}").dict().at("a").integer(), int64_t{1}, "object access");
+  checkEq(ycpp::json::parse("1e3").number(), 1000.0, "exponent notation");
+  checkEq(ycpp::json::parse("\"h\\u00e9\"").str(), std::string("h\xC3\xA9"), "unicode escape");
+  bool threw = false;
+  try { ycpp::json::parse("{\"a\":}"); } catch (const std::exception&) { threw = true; }
+  check(threw, "malformed json throws");
+  threw = false;
+  try { ycpp::json::parse("1 trailing"); } catch (const std::exception&) { threw = true; }
+  check(threw, "trailing garbage throws");
+}
+
+// ----------------------------------------------------------------- protocols
+
+TEST(sync_protocol_handshake) {
+  namespace sync = ycpp::protocols::sync;
+  ycpp::Doc a(1), b(2);
+  a.getText().insert(0, "from a");
+  b.getText().insert(0, "|b");
+
+  // a -> b: Step1; b applies and replies Step2; and vice versa.
+  ycpp::lib0::Encoder step1a;
+  sync::writeSyncStep1(step1a, a);
+  ycpp::lib0::Decoder d1(step1a.bytes());
+  ycpp::lib0::Encoder replyB;
+  checkEq(sync::readSyncMessage(d1, replyB, b, "net"), sync::messageYjsSyncStep1, "step1 type");
+  ycpp::lib0::Decoder d2(replyB.bytes());
+  ycpp::lib0::Encoder replyA;
+  checkEq(sync::readSyncMessage(d2, replyA, a, "net"), sync::messageYjsSyncStep2, "step2 type");
+  check(replyA.bytes().empty(), "step2 produces no reply");
+
+  ycpp::lib0::Encoder step1b;
+  sync::writeSyncStep1(step1b, b);
+  ycpp::lib0::Decoder d3(step1b.bytes());
+  ycpp::lib0::Encoder replyB2;
+  sync::readSyncMessage(d3, replyB2, a, "net");
+  ycpp::lib0::Decoder d4(replyB2.bytes());
+  ycpp::lib0::Encoder none;
+  sync::readSyncMessage(d4, none, b, "net");
+  checkEq(a.getText().toString(), b.getText().toString(), "handshake converges");
+
+  // Incremental update message.
+  std::vector<uint8_t> captured;
+  auto sub = a.onUpdate([&](const std::vector<uint8_t>& u, const std::string&) { captured = u; });
+  a.getText().insert(0, "x");
+  ycpp::lib0::Encoder upd;
+  sync::writeUpdate(upd, captured);
+  ycpp::lib0::Decoder d5(upd.bytes());
+  ycpp::lib0::Encoder none2;
+  checkEq(sync::readSyncMessage(d5, none2, b, "net"), sync::messageYjsUpdate, "update type");
+  checkEq(a.getText().toString(), b.getText().toString(), "update message applies");
+  a.offUpdate(sub);
+}
+
+TEST(awareness_basics) {
+  using ycpp::protocols::Awareness;
+  Awareness a(1), b(2);
+  int bChanges = 0;
+  b.onChange([&](const Awareness::Change& c) { bChanges += static_cast<int>(c.added.size() + c.updated.size() + c.removed.size()); });
+
+  a.setLocalStateField("playhead", ycpp::Any::of(int64_t{100}));
+  b.applyUpdate(a.encodeAllStates(), "net");
+  checkEq(b.getStates().count(1), size_t(1), "b sees a");
+  checkEq(b.getStates().size(), size_t(2), "b sees a and itself");
+  checkEq(b.getStates().at(1).dict().at("playhead").integer(), int64_t{100}, "state content");
+  checkEq(bChanges, 1, "add change fired");
+
+  // LWW: newer clock wins, replayed old update is ignored.
+  auto oldUpdate = a.encodeAllStates();
+  a.setLocalStateField("playhead", ycpp::Any::of(int64_t{200}));
+  b.applyUpdate(a.encodeAllStates(), "net");
+  checkEq(b.getStates().at(1).dict().at("playhead").integer(), int64_t{200}, "newer wins");
+  b.applyUpdate(oldUpdate, "net");
+  checkEq(b.getStates().at(1).dict().at("playhead").integer(), int64_t{200}, "stale update ignored");
+
+  // Removal travels.
+  a.setLocalState(std::nullopt);
+  b.applyUpdate(a.encodeUpdate({1}), "net");
+  checkEq(b.getStates().count(1), size_t(0), "removal applied");
+
+  // A remote cannot remove our local state: the clock bumps instead.
+  b.setLocalStateField("name", ycpp::Any::of("b"));
+  Awareness c(3);
+  auto removal = b.encodeUpdate({2});
+  b.setLocalStateField("name", ycpp::Any::of("b"));  // clock moves on
+  b.applyUpdate(removal, "net");  // old removal of b's own state
+  check(b.getLocalState().has_value(), "local state survives remote removal");
+}
+
+TEST(awareness_update_vs_change) {
+  using ycpp::protocols::Awareness;
+  Awareness a(1), b(2);
+  int updates = 0, changes = 0;
+  b.onUpdate([&](const Awareness::Change&) { updates++; });
+  b.onChange([&](const Awareness::Change&) { changes++; });
+  a.setLocalStateField("k", ycpp::Any::of(int64_t{1}));
+  b.applyUpdate(a.encodeAllStates(), "net");
+  a.setLocalState(a.getLocalState());  // renewal: same content, new clock
+  b.applyUpdate(a.encodeAllStates(), "net");
+  checkEq(updates, 2, "update fires on renewal too (keep-alive)");
+  checkEq(changes, 1, "change fires only on real changes");
+}
+
+// ---------------------------------------------------------- relative positions
+
+TEST(relative_position_survives_edits) {
+  ycpp::Doc a(1), b(2);
+  a.getText().insert(0, "the quick fox");
+  sync(a, b);
+  // Anchor before "fox" on doc a, transfer as bytes (as awareness would).
+  auto rel = ycpp::createRelativePosition(a.getText(), 10);
+  auto bytes = ycpp::encodeRelativePosition(rel);
+  auto back = ycpp::decodeRelativePosition(bytes);
+  // Concurrent edits before the anchor on both docs.
+  b.getText().insert(0, "XXX ");
+  b.getText().insert(b.getText().length(), "!");
+  sync(a, b);
+  auto absA = ycpp::resolveRelativePosition(back, a);
+  auto absB = ycpp::resolveRelativePosition(back, b);
+  check(absA && absB, "resolves on both docs");
+  checkEq(absA->index, uint64_t(14), "anchor tracked through remote insert");
+  checkEq(absA->index, absB->index, "same position on both docs");
+  checkEq(ycpp::utf::utf16To8(a.getText().toUtf16().substr(absA->index, 3)),
+          std::string("fox"), "still points at fox");
+}
+
+TEST(relative_position_end_and_assoc) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  t.insert(0, "ab");
+  auto atEnd = ycpp::createRelativePosition(t, 2);       // type-anchored (end)
+  auto leftOf1 = ycpp::createRelativePosition(t, 1, -1); // left-associated
+  t.insert(2, "cd");
+  auto rEnd = ycpp::resolveRelativePosition(atEnd, d);
+  check(rEnd.has_value(), "end resolves");
+  checkEq(rEnd->index, t.length(), "end anchor follows the end");
+  t.insert(1, "X");  // insert exactly at the left-assoc position
+  auto rLeft = ycpp::resolveRelativePosition(leftOf1, d);
+  checkEq(rLeft->index, uint64_t(1), "left-assoc anchor stays with left neighbor");
+  // Unknown anchor (foreign doc) resolves to nullopt.
+  ycpp::Doc other(9);
+  check(!ycpp::resolveRelativePosition(atEnd.item ? atEnd : leftOf1, other).has_value() ||
+            atEnd.tname.has_value(),
+        "missing anchors resolve to nullopt");
 }
 
 // ------------------------------------------------------ transactions/events

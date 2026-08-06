@@ -15,54 +15,79 @@
             --muted: #9aa4af; --accent: #6ea8ff; --ok: #4ac26b; --bad: #ff7b72; }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--text);
-         font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin-inline: auto; }
+  body { margin: 0 auto; padding: 1.5rem; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; }
   h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
   .sub { color: var(--muted); margin-bottom: 1rem; }
   .status { display: flex; gap: 1rem; align-items: center; font-size: .85rem;
-            color: var(--muted); margin-bottom: .75rem; font-family: var(--mono); }
+            color: var(--muted); margin-bottom: .75rem; font-family: var(--mono);
+            flex-wrap: wrap; }
   .dot { width: .6rem; height: .6rem; border-radius: 50%; background: var(--bad);
          display: inline-block; margin-right: .35rem; }
   .dot.on { background: var(--ok); }
-  textarea { width: 100%; height: 60vh; resize: vertical; border: 1px solid var(--border);
+  .peers { display: flex; gap: .4rem; }
+  .peer { padding: .05rem .5rem; border-radius: 999px; font-size: .75rem; color: #fff; }
+  textarea { width: 100%; height: 45vh; resize: vertical; border: 1px solid var(--border);
              border-radius: 10px; padding: 1rem; font: 15px/1.5 var(--mono);
              background: var(--panel); color: var(--text); }
   textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .timebar { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+             padding: 1rem; margin-top: 1rem; }
+  .timebar label { font-size: .85rem; color: var(--muted); display: flex;
+                   justify-content: space-between; margin-bottom: .5rem; }
+  .timebar input { width: 100%; accent-color: var(--accent); }
   .hint { color: var(--muted); font-size: .8rem; margin-top: .75rem; }
   code { font-family: var(--mono); font-size: .85em; }
 </style>
 </head>
 <body>
 <h1>y-cpp live sync</h1>
-<div class="sub">A real Yjs peer, synced over WebSocket with the <code>ycpp-sync</code> C++ server.
-  Open this page in several windows and run <code>ycpp-sync connect</code> in terminals — everyone edits the same text.</div>
+<div class="sub">A stock <code>y-websocket</code> provider talking to the <code>ycpp-sync</code>
+  C++ server: shared text (CRDT) and an awareness-driven timebar (last writer wins).</div>
 <div class="status">
   <span><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
-  <span id="peer"></span>
-  <span id="len"></span>
+  <span id="me"></span>
+  <span class="peers" id="peers"></span>
 </div>
 <textarea id="editor" placeholder="type here — every keystroke syncs live" spellcheck="false"></textarea>
+
+<div class="timebar">
+  <label><span>timebar — anyone may drive, last writer wins (awareness)</span>
+         <span id="tval">0</span></label>
+  <input id="timebar" type="range" min="0" max="1000" value="0">
+</div>
+
 <div class="hint">
   Server: <code>./build/ycpp-sync serve</code> · native peer:
-  <code>./build/ycpp-sync connect ws://localhost:8765</code> ·
-  ws URL override: <code>?ws=ws://host:port</code>
+  <code>./build/ycpp-sync connect ws://localhost:8765</code> — presence, text, and
+  the timebar stay in sync across browsers and native peers.
 </div>
 
 <script type="module">
 import * as Y from 'https://cdn.jsdelivr.net/npm/yjs@13.6.27/+esm'
+import { WebsocketProvider } from 'https://cdn.jsdelivr.net/npm/y-websocket@3.0.0/+esm'
 
 const doc = new Y.Doc()
 const ytext = doc.getText('default')
-const editor = document.getElementById('editor')
+const provider = new WebsocketProvider(
+  (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host, 'ycpp', doc)
+const awareness = provider.awareness
+
+const names = ['ruby', 'ochre', 'jade', 'azure', 'plum', 'coral', 'sage', 'gold']
+const colors = ['#e05d5d', '#d08a2f', '#3fa66a', '#4a8fe0', '#9a6ae0', '#e07a9a', '#6a9a6a', '#c0a030']
+const pick = Math.floor(Math.random() * names.length)
+awareness.setLocalStateField('user', { name: names[pick] + '-' + (doc.clientID % 100), color: colors[pick] })
+document.getElementById('me').textContent = 'me: ' + names[pick] + '-' + (doc.clientID % 100)
+
 const dot = document.getElementById('dot')
 const conn = document.getElementById('conn')
-document.getElementById('peer').textContent = 'client ' + doc.clientID
+provider.on('status', e => {
+  dot.classList.toggle('on', e.status === 'connected')
+  conn.textContent = e.status
+})
 
-const params = new URLSearchParams(location.search)
-const wsUrl = params.get('ws') ||
-  (location.protocol.startsWith('http') ? `ws://${location.host}` : 'ws://localhost:8765')
-
-// --- textarea <-> Y.Text binding (common-prefix/suffix diff) ---
+// --- shared text: textarea binding with relative-position caret ---
+const editor = document.getElementById('editor')
 let applying = false
 editor.addEventListener('input', () => {
   const oldVal = ytext.toString()
@@ -79,51 +104,65 @@ editor.addEventListener('input', () => {
   })
   applying = false
 })
-// While a remote update is applied, the caret is captured as Y.RelativePosition
-// (anchored to content, not to a numeric offset) and restored afterwards, so
-// remote edits before the caret don't make it drift.
 let relSel = null
-ytext.observe(() => {
-  document.getElementById('len').textContent = ytext.length + ' chars'
+doc.on('beforeTransaction', tr => {
+  if (!tr.local && relSel === null) {
+    relSel = [
+      Y.createRelativePositionFromTypeIndex(ytext, editor.selectionStart),
+      Y.createRelativePositionFromTypeIndex(ytext, editor.selectionEnd)
+    ]
+  }
+})
+ytext.observe((e) => {
   if (applying) return
   editor.value = ytext.toString()
-  const absStart = relSel && Y.createAbsolutePositionFromRelativePosition(relSel[0], doc)
-  const absEnd = relSel && Y.createAbsolutePositionFromRelativePosition(relSel[1], doc)
-  editor.selectionStart = absStart ? absStart.index : editor.value.length
-  editor.selectionEnd = absEnd ? absEnd.index : editor.value.length
-})
-const applyRemote = update => {
-  relSel = [
-    Y.createRelativePositionFromTypeIndex(ytext, editor.selectionStart),
-    Y.createRelativePositionFromTypeIndex(ytext, editor.selectionEnd)
-  ]
-  Y.applyUpdate(doc, update, 'ws')
+  if (relSel) {
+    const a = Y.createAbsolutePositionFromRelativePosition(relSel[0], doc)
+    const b = Y.createAbsolutePositionFromRelativePosition(relSel[1], doc)
+    editor.selectionStart = a ? a.index : editor.value.length
+    editor.selectionEnd = b ? b.index : editor.value.length
+  }
   relSel = null
-}
-
-// --- WebSocket transport: binary messages are Yjs v1 updates ---
-let ws = null
-const connect = () => {
-  ws = new WebSocket(wsUrl)
-  ws.binaryType = 'arraybuffer'
-  ws.onopen = () => {
-    dot.classList.add('on')
-    conn.textContent = wsUrl
-    // Offer our state (covers edits made while offline); the server sends its own.
-    ws.send(Y.encodeStateAsUpdate(doc))
-  }
-  ws.onmessage = e => applyRemote(new Uint8Array(e.data))
-  ws.onclose = () => {
-    dot.classList.remove('on')
-    conn.textContent = 'reconnecting…'
-    setTimeout(connect, 1500)
-  }
-  ws.onerror = () => ws.close()
-}
-doc.on('update', (update, origin) => {
-  if (origin !== 'ws' && ws && ws.readyState === WebSocket.OPEN) ws.send(update)
 })
-connect()
+
+// --- presence + timebar (awareness, last writer wins) ---
+const peersEl = document.getElementById('peers')
+const bar = document.getElementById('timebar')
+const tval = document.getElementById('tval')
+let dragging = false
+let lastSeen = { at: 0 }
+
+bar.addEventListener('input', () => {
+  dragging = true
+  tval.textContent = bar.value
+  awareness.setLocalStateField('playhead', { t: Number(bar.value), at: Date.now() })
+})
+bar.addEventListener('change', () => { dragging = false })
+
+const render = () => {
+  const states = awareness.getStates()
+  peersEl.innerHTML = ''
+  let latest = null
+  for (const [clientID, state] of states) {
+    if (state.user) {
+      const el = document.createElement('span')
+      el.className = 'peer'
+      el.style.background = state.user.color || '#888'
+      el.textContent = state.user.name || clientID
+      peersEl.appendChild(el)
+    }
+    if (state.playhead && state.playhead.at > (latest ? latest.at : lastSeen.at)) {
+      latest = state.playhead
+    }
+  }
+  if (latest && !dragging) {
+    lastSeen = latest
+    bar.value = latest.t
+    tval.textContent = latest.t
+  }
+}
+awareness.on('change', render)
+render()
 </script>
 </body>
 </html>

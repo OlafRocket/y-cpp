@@ -19,3 +19,4 @@
 #include "ycpp/type.hpp"      // YType: the shared type node
 #include "ycpp/wrappers.hpp"  // Text / Array / Map public handles
 #include "ycpp/doc.hpp"       // Doc: store, transactions, update codec
+#include "ycpp/position.hpp"  // relative positions (content-anchored cursors)

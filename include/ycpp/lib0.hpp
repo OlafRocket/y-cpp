@@ -60,6 +60,12 @@ class Encoder {
     buf_.insert(buf_.end(), data.begin(), data.end());
   }
 
+  // lib0 encoding.writeVarUint8Array: varUint byte length + bytes.
+  void writeVarUint8Array(std::span<const uint8_t> data) {
+    writeVarUint(data.size());
+    writeBytes(data);
+  }
+
   const std::vector<uint8_t>& bytes() const { return buf_; }
   std::vector<uint8_t> take() { return std::move(buf_); }
 
@@ -111,6 +117,9 @@ class Decoder {
     pos_ += n;
     return s;
   }
+
+  // lib0 decoding.readVarUint8Array: varUint byte length + bytes.
+  std::vector<uint8_t> readVarUint8Array() { return readBytes(readVarUint()); }
 
   std::vector<uint8_t> readBytes(uint64_t n) {
     need(n);

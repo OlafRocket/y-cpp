@@ -1,9 +1,8 @@
-// End-to-end test of the ycpp-sync live server: two real yjs peers connect
-// over WebSocket, edit concurrently, and must converge through the C++ relay.
+// End-to-end test of the ycpp-sync server speaking the y-websocket protocol:
+// two STOCK y-websocket providers (unmodified npm package) connect, sync
+// text through the C++ relay, and see each other through awareness.
 // Usage: node websocket.test.js <path-to-ycpp-sync> <web-dir>
 'use strict'
-const Y = require('yjs')
-const WebSocket = require('ws')
 const http = require('http')
 const { spawn } = require('child_process')
 
@@ -25,36 +24,12 @@ const check = (cond, msg) => {
   }
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-const withTimeout = (p, ms, what) =>
-  Promise.race([p, sleep(ms).then(() => { throw new Error(`timeout: ${what}`) })])
-
-// A yjs peer connected to the ycpp-sync server, mirroring web/live.html.
-class Peer {
-  constructor () {
-    this.doc = new Y.Doc()
-    this.text = this.doc.getText('default')
-    this.ws = new WebSocket(`ws://127.0.0.1:${PORT}`)
-    this.opened = new Promise(res => this.ws.on('open', res))
-    this.firstMessage = new Promise(res => this.ws.once('message', res))
-    this.ws.on('message', data => Y.applyUpdate(this.doc, new Uint8Array(data), 'ws'))
-    this.doc.on('update', (update, origin) => {
-      if (origin !== 'ws' && this.ws.readyState === WebSocket.OPEN) this.ws.send(update)
-    })
+const until = async (fn, what, ms = 8000) => {
+  const deadline = Date.now() + ms
+  while (!fn()) {
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`)
+    await sleep(25)
   }
-  async connect () {
-    await withTimeout(this.opened, 5000, 'ws open')
-    this.ws.send(Y.encodeStateAsUpdate(this.doc))
-    await withTimeout(this.firstMessage, 5000, 'initial state')
-  }
-  // wait until a condition on the text holds (updates arrive asynchronously)
-  async until (fn, what) {
-    const deadline = Date.now() + 5000
-    while (!fn()) {
-      if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`)
-      await sleep(25)
-    }
-  }
-  close () { this.ws.close() }
 }
 
 const httpGet = path => new Promise((resolve, reject) => {
@@ -66,58 +41,97 @@ const httpGet = path => new Promise((resolve, reject) => {
 })
 
 const main = async () => {
+  // Import yjs through the same ESM resolution as y-websocket so both share
+  // one module instance (mixing the CJS and ESM builds breaks instanceof).
+  const Y = await import('yjs')
+  const { WebsocketProvider } = await import('y-websocket')
+  const WebSocketPolyfill = require('ws')
+
+  // Watchdog: never let a wedged run hang the suite.
+  const watchdog = setTimeout(() => {
+    console.error('FAIL global test timeout')
+    process.exit(1)
+  }, 90000)
+  watchdog.unref()
+
   const server = spawn(BIN, ['serve', '--headless', '--port', String(PORT), '--web', WEB],
                        { stdio: ['ignore', 'pipe', 'inherit'] })
+  const serverExit = new Promise(resolve => server.on('exit', resolve))
   const listening = new Promise((resolve, reject) => {
     server.stdout.on('data', d => { if (String(d).includes('listening')) resolve() })
-    server.on('exit', c => reject(new Error(`server exited early (${c})`)))
+    serverExit.then(c => reject(new Error(`server exited early (${c})`)))
   })
-  await withTimeout(listening, 5000, 'server start')
+  await Promise.race([listening,
+                      sleep(10000).then(() => { throw new Error('server did not start') })])
+
+  const providers = []
+  const peer = () => {
+    const doc = new Y.Doc()
+    const provider = new WebsocketProvider(`ws://127.0.0.1:${PORT}`, 'room', doc,
+                                           { WebSocketPolyfill })
+    providers.push(provider)
+    return { doc, provider, text: doc.getText('default') }
+  }
 
   try {
-    // HTTP serves the live page
-    const page = await withTimeout(httpGet('/'), 5000, 'GET /')
+    // HTTP still serves the live page (any path -> single-room page).
+    const page = await httpGet('/')
     check(page.status === 200 && page.body.includes('y-cpp live sync'), 'GET / serves live.html')
-    const missing = await withTimeout(httpGet('/nope.html'), 5000, 'GET 404')
-    check(missing.status === 404, 'GET /nope.html is 404')
-    const evil = await withTimeout(httpGet('/../CMakeLists.txt'), 5000, 'GET traversal')
-    check(evil.status !== 200, 'path traversal rejected')
 
-    // Peer A connects and edits
-    const a = new Peer()
-    await a.connect()
-    check(a.text.toString() === '', 'A starts empty')
+    // Stock provider A connects and syncs.
+    const a = peer()
+    await until(() => a.provider.synced, 'A synced')
+    check(true, 'stock y-websocket provider completes the sync handshake')
     a.text.insert(0, 'hello from A')
 
-    // Peer B connects later and must receive A's text from the server doc
-    const b = new Peer()
-    await b.connect()
-    await b.until(() => b.text.toString() === 'hello from A', 'B initial state')
-    check(true, 'B received state on connect')
+    // B joins later and receives A's text through the C++ server.
+    const b = peer()
+    await until(() => b.provider.synced, 'B synced')
+    await until(() => b.text.toString() === 'hello from A', 'B received state')
+    check(true, 'late joiner receives document through cpp server')
 
-    // B edits; the server must relay to A
+    // Live relay in both directions.
     b.text.insert(b.text.length, ' + B')
-    await a.until(() => a.text.toString() === 'hello from A + B', 'relay B→A')
-    check(true, 'update relayed to A')
-
-    // Concurrent edits at the same position converge identically
+    await until(() => a.text.toString() === 'hello from A + B', 'relay B->A')
+    check(true, 'updates relayed live')
     a.text.insert(0, '[a]')
     b.text.insert(0, '[b]')
-    await a.until(() => a.text.toString() === b.text.toString(), 'convergence')
-    check(a.text.toString() === b.text.toString(), 'concurrent edits converged')
+    await until(() => a.text.toString() === b.text.toString(), 'convergence')
     check(a.text.toString().includes('[a]') && a.text.toString().includes('[b]'),
-          'both concurrent edits present')
+          'concurrent edits converge')
 
-    // A third peer sees the final converged state
-    const c = new Peer()
-    await c.connect()
-    await c.until(() => c.text.toString() === a.text.toString(), 'C initial state')
-    check(true, 'late joiner gets converged state')
+    // Awareness: peers see each other's states through the server,
+    // including the timebar pattern (last writer wins).
+    a.provider.awareness.setLocalStateField('user', { name: 'A' })
+    b.provider.awareness.setLocalStateField('user', { name: 'B' })
+    a.provider.awareness.setLocalStateField('playhead', { t: 100, at: 1 })
+    await until(() => {
+      const s = [...b.provider.awareness.getStates().values()]
+      return s.some(st => st.user && st.user.name === 'A' && st.playhead && st.playhead.t === 100)
+    }, 'awareness A->B')
+    check(true, 'awareness states relayed (timebar value visible)')
+    b.provider.awareness.setLocalStateField('playhead', { t: 250, at: 2 })
+    await until(() => {
+      const s = [...a.provider.awareness.getStates().values()]
+      return s.some(st => st.playhead && st.playhead.t === 250)
+    }, 'awareness B->A')
+    check(true, 'timebar last-write visible on the other side')
 
-    a.close(); b.close(); c.close()
+    // Disconnect removes the peer's awareness state.
+    const bClient = b.doc.clientID
+    b.provider.destroy()
+    await until(() => ![...a.provider.awareness.getStates().keys()].includes(bClient),
+                'awareness removal on disconnect')
+    check(true, 'server removes awareness of disconnected peers')
+
+    // A third peer still gets the full converged document.
+    const c = peer()
+    await until(() => c.provider.synced && c.text.toString() === a.text.toString(), 'C synced')
+    check(true, 'fresh peer syncs converged state')
   } finally {
+    for (const p of providers) { try { p.destroy() } catch (e) {} }
     server.kill('SIGTERM')
-    await new Promise(res => server.on('exit', res))
+    await Promise.race([serverExit, sleep(3000).then(() => server.kill('SIGKILL'))])
   }
 
   if (failures > 0) {
@@ -125,6 +139,7 @@ const main = async () => {
     process.exit(1)
   }
   console.log('all websocket tests passed')
+  process.exit(0)  // lingering provider handles keep the loop alive
 }
 
 main().catch(e => {

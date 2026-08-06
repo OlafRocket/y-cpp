@@ -19,6 +19,10 @@
 #include "ycpp/wrappers.hpp"
 
 namespace ycpp {
+
+struct RelativePosition;
+struct AbsolutePosition;
+
 struct DeleteRange {
   uint64_t clock = 0;
   uint64_t len = 0;
@@ -91,6 +95,7 @@ class Doc {
   friend class Text;
   friend class Array;
   friend class Map;
+  friend std::optional<AbsolutePosition> resolveRelativePosition(const RelativePosition&, Doc&);
 
   struct Transaction {
     std::map<uint64_t, uint64_t> beforeState;

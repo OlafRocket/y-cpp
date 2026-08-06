@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 BIN="${1:?usage: run_ws_test.sh <path-to-ycpp-sync>}"
 NODE="${NODE:-node}"
 
-if [ ! -d node_modules/yjs ] || [ ! -d node_modules/ws ]; then
+if [ ! -d node_modules/yjs ] || [ ! -d node_modules/ws ] || [ ! -d node_modules/y-websocket ]; then
   echo "installing yjs + ws for websocket tests..."
   npm install --no-audit --no-fund --loglevel=error
 fi

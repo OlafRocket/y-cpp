@@ -129,10 +129,9 @@ websocket transport are *not* part of the core and are out of scope.)
 - Y.Xml* types and subdocuments: decoded and preserved on the wire, no API.
 - Rich-text formatting attributes and embeds (`ContentFormat`,
   `ContentEmbed`): decoded and preserved on the wire, no API.
-- Undo manager, snapshots, relative positions.
+- Undo manager, snapshots.
 - Deep (subtree) observers (`observeDeep`).
-- Awareness protocol and any network transport (sync is byte-array in/out;
-  the demo exchanges base64 blobs).
+- Any network transport (the protocol modules are byte-array in/out).
 
 Implemented since 0.2 (was out of scope in 0.1):
 
@@ -143,6 +142,13 @@ Implemented since 0.2 (was out of scope in 0.1):
   keep their type ref and are not replaced with `GC` structs (equivalent to a
   yjs doc with `gc: false` for type nodes); GC structs from peers are still
   accepted.
+
+Implemented since 0.7 (was out of scope in 0.1):
+
+- Relative positions (yjs RelativePosition, without followRedone), and — in
+  the separate `ycpp-protocols` target, mirroring the yjs / y-protocols
+  package split — the sync handshake and the awareness protocol, verified
+  end-to-end against the stock y-websocket provider.
 
 Implemented since 0.4 (was out of scope in 0.1):
 

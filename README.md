@@ -30,6 +30,15 @@ lib0 v1 update codec); the Rust implementation
   v1 update — the hook a sync provider subscribes to
 - Yjs **v1 update** encode/decode: `applyUpdate`, `encodeStateAsUpdate`,
   `encodeStateVector`, state-vector–based diff sync
+- **y-protocols** (since 0.7, separate `ycpp-protocols` target mirroring the
+  upstream package split): the standard sync handshake
+  (`ycpp/protocols/sync.hpp`) and **awareness** — ephemeral last-write-wins
+  presence states for cursors, names, or a driven timebar
+  (`ycpp/protocols/awareness.hpp`). Both are transport-agnostic byte APIs,
+  byte-compatible with the y-protocols npm package
+- **Relative positions** (since 0.7): content-anchored cursors/anchors that
+  survive concurrent edits, encode/decode compatible with yjs
+- A strict JSON parser (`json::parse` -> `Any`) alongside the dump
 - YATA conflict resolution — byte-for-byte the same ordering decisions as yjs
 - Tombstone deletes with DeleteSets, item splitting, GC structs from peers
 - Item merging + tombstone garbage collection (since 0.2): adjacent items
@@ -39,8 +48,8 @@ lib0 v1 update codec); the Rust implementation
   preserved across re-encodes)
 
 Out of scope for now: XML types (decoded/preserved, no API), rich-text
-attributes, subdocuments, deep (subtree) observers, v2 encoding, undo,
-awareness, transports. See the feature doc.
+attributes, subdocuments, deep (subtree) observers, v2 encoding, undo. See
+the feature doc.
 
 ## Project layout
 
@@ -49,6 +58,8 @@ pulls in everything (individual headers can be included directly):
 
 ```
 include/ycpp/
+  protocols/    y-protocols ports: sync.hpp, awareness.hpp (ycpp-protocols)
+  position.hpp  relative positions (content-anchored cursors)
   lib0.hpp      lib0 binary primitives (varints, strings, floats)
   utf.hpp       UTF-8 <-> UTF-16 with JavaScript semantics
   any.hpp       the lib0 "Any" value model + binary codec
@@ -66,6 +77,8 @@ src/
   update_codec.cpp  Yjs v1 update decode/encode
   transaction.cpp   transactions, events, observers, subscriptions
   types.cpp         list/map operations, wrappers, JSON dump
+  position.cpp      relative position create/resolve/codec
+  protocols/        awareness implementation (ycpp-protocols target)
   internal.hpp      shared implementation helpers (not installed)
 ```
 
@@ -116,19 +129,19 @@ entirely inside the ycpp library, the tool only moves update bytes:
 ./build/ycpp-sync serve                     # http://localhost:8765
 ```
 
-- **Browsers**: open `http://localhost:8765/` (serves `web/live.html`, a real
-  Yjs peer) in any number of windows — every keystroke syncs live.
+Since 0.7 `ycpp-sync` speaks the **full y-websocket protocol** (sync +
+awareness envelope) — it is a drop-in replacement for a y-websocket server:
+any stock `y-websocket` provider connects unmodified.
+
+- **Browsers**: open `http://localhost:8765/` — `web/live.html` uses the
+  stock y-websocket provider, with live text, presence avatars, and an
+  awareness-driven timebar (anyone drives, last writer wins).
 - **Native peers**: `./build/ycpp-sync connect ws://localhost:8765` opens a
   minimal terminal text box (POSIX terminals) editing the same text with its
   own ycpp document. `serve` itself also opens the text box when run on a TTY;
   use `--headless` on servers/Windows.
 - `--doc FILE` persists the document as a Yjs v1 update file (readable by
   `ycpp` and by yjs itself).
-
-Protocol: on connect a peer receives the full state as one Yjs v1 update and
-offers its own; afterwards every binary WebSocket message is an incremental
-update relayed to all other peers. Updates are idempotent and commutative, so
-this trivial relay is a correct sync provider.
 
 ## Manual browser test (no server)
 
