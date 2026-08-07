@@ -22,6 +22,8 @@ Item* Doc::splitItem(Item* it, uint64_t diff) {
   r->kind = it->kind;
   r->deleted = it->deleted;
   r->integrated = true;
+  r->keep = it->keep;
+  if (it->redone) r->redone = ID{it->redone->client, it->redone->clock + diff};
   r->len = it->len - diff;
   switch (it->kind) {
     case ContentKind::String:
@@ -112,11 +114,13 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
       return false;  // Binary/Type/Embed/Format/Doc do not merge
   }
   if (l->id.clock + l->len != r->id.clock) return false;
+  if (l->redone || r->redone) return false;  // undo provenance must stay addressable
   if (l->kind != ContentKind::GC) {
     if (l->right != r) return false;
     if (!r->origin || !(*r->origin == l->lastId())) return false;
     if (!sameOpt(l->rightOrigin, r->rightOrigin)) return false;
   }
+  if (r->keep) l->keep = true;
   if (l->kind == ContentKind::String) l->str() += r->str();
   if (l->kind == ContentKind::Any || l->kind == ContentKind::JSON) {
     l->anyVals().insert(l->anyVals().end(), r->anyVals().begin(), r->anyVals().end());
@@ -136,5 +140,19 @@ bool Doc::tryMergeWithLeft(std::vector<Item*>& v, size_t pos) {
 }
 
 void Doc::releaseItem(Item* it) { items_.erase(it); }
+
+std::pair<Item*, uint64_t> Doc::followRedone(const ID& id) const {
+  ID nextId = id;
+  uint64_t diff = 0;
+  Item* item = nullptr;
+  while (true) {
+    if (diff > 0) nextId = ID{nextId.client, nextId.clock + diff};
+    item = getItem(nextId);
+    diff = nextId.clock - item->id.clock;
+    if (item->kind == ContentKind::GC || !item->redone) break;
+    nextId = *item->redone;
+  }
+  return {item, diff};
+}
 
 }  // namespace ycpp

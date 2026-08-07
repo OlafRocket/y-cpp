@@ -60,6 +60,11 @@ struct Item {
   Content content;
   bool deleted = false;
   bool integrated = false;
+  // Undo support (yjs): redone points at the item that re-created this one
+  // after an undo; keep exempts a tombstone from content GC while an undo
+  // stack still references it.
+  std::optional<ID> redone;
+  bool keep = false;
 
   ID lastId() const { return ID{id.client, id.clock + len - 1}; }
   bool countable() const {

@@ -129,7 +129,7 @@ websocket transport are *not* part of the core and are out of scope.)
 - Y.Xml* types and subdocuments: decoded and preserved on the wire, no API.
 - Rich-text formatting attributes and embeds (`ContentFormat`,
   `ContentEmbed`): decoded and preserved on the wire, no API.
-- Undo manager, snapshots.
+- Snapshots.
 - Deep (subtree) observers (`observeDeep`).
 - Any network transport (the protocol modules are byte-array in/out).
 
@@ -142,6 +142,13 @@ Implemented since 0.2 (was out of scope in 0.1):
   keep their type ref and are not replaced with `GC` structs (equivalent to a
   yjs doc with `gc: false` for type nodes); GC structs from peers are still
   accepted.
+
+Implemented since 0.8 (was out of scope in 0.1):
+
+- UndoManager: a port of yjs UndoManager/redoItem/keepItem/followRedone —
+  origin-filtered capture with timeout grouping, keep-flagged tombstones
+  exempt from GC while revivable, and redone chains linking deleted items to
+  their revived copies (followed by relative positions).
 
 Implemented since 0.7 (was out of scope in 0.1):
 

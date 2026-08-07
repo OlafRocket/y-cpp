@@ -38,6 +38,10 @@ lib0 v1 update codec); the Rust implementation
   byte-compatible with the y-protocols npm package
 - **Relative positions** (since 0.7): content-anchored cursors/anchors that
   survive concurrent edits, encode/decode compatible with yjs
+- **UndoManager** (since 0.8): selective collaborative undo/redo — reverts
+  only tracked (by transaction origin) local changes, leaving interleaved
+  remote edits intact; capture-timeout grouping, per-type scoping, content
+  revival through `redone` chains that relative positions follow
 - A strict JSON parser (`json::parse` -> `Any`) alongside the dump
 - YATA conflict resolution — byte-for-byte the same ordering decisions as yjs
 - Tombstone deletes with DeleteSets, item splitting, GC structs from peers
@@ -48,8 +52,8 @@ lib0 v1 update codec); the Rust implementation
   preserved across re-encodes)
 
 Out of scope for now: XML types (decoded/preserved, no API), rich-text
-attributes, subdocuments, deep (subtree) observers, v2 encoding, undo. See
-the feature doc.
+attributes, subdocuments, deep (subtree) observers, v2 encoding, snapshots.
+See the feature doc.
 
 ## Project layout
 
@@ -68,6 +72,7 @@ include/ycpp/
   event.hpp     observer events, deltas, map changes, Subscription
   type.hpp      YType: the shared type node (list start + key map)
   wrappers.hpp  Text / Array / Map public handles
+  undo.hpp      UndoManager: selective collaborative undo/redo
   doc.hpp       Doc: store, transactions, update codec entry points
   ycpp.hpp      umbrella header
 src/
@@ -180,6 +185,12 @@ a.onUpdate([](const std::vector<uint8_t>& update, const std::string& origin) {
   /* forward `update` to peers */
 });
 a.transact([&] { /* several edits -> one event, one update */ }, "my-origin");
+
+// Selective undo: reverts local changes only, remote edits stay.
+ycpp::UndoManager undo(a, {a.getText()});
+a.getText().insert(0, "typo");
+undo.undo();   // gone — even if remote edits interleaved
+undo.redo();
 ```
 
 ## License

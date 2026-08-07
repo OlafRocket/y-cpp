@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ycpp VERSION 0.7.0 LANGUAGES CXX)
+project(ycpp VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # editor tooling (IntelliSense/clangd)
@@ -18,6 +18,7 @@ add_library(ycpp STATIC
   src/transaction.cpp
   src/position.cpp
   src/types.cpp
+  src/undo.cpp
   src/update_codec.cpp)
 target_include_directories(ycpp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

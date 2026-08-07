@@ -214,6 +214,20 @@ void Doc::cleanupTransaction(Transaction& tx) {
     }
   }
 
+  // 1b. afterTransaction handlers (the UndoManager hook): they may mark
+  // items keep before garbage collection runs.
+  if (!afterTxHandlers_.empty()) {
+    TransactionEvent ev;
+    ev.origin = tx.origin;
+    ev.local = tx.local;
+    ev.beforeState = &tx.beforeState;
+    for (const auto& [client, v] : store_) ev.afterState[client] = getState(client);
+    ev.deleteSet = &tx.ds;
+    for (const auto& [type, subs] : tx.changed) ev.changedTypes.push_back(type);
+    auto handlers = afterTxHandlers_;
+    for (const auto& [handle, fn] : handlers) fn(ev);
+  }
+
   // 2. Garbage-collect droppable content deleted in this transaction.
   for (const auto& [client, ranges] : tx.ds) {
     auto sit = store_.find(client);
@@ -223,7 +237,7 @@ void Doc::cleanupTransaction(Transaction& tx) {
       size_t idx = findIndex(v, r.clock);
       while (idx < v.size() && v[idx]->id.clock < r.clock + r.len) {
         Item* s = v[idx++];
-        if (!s->deleted) continue;
+        if (!s->deleted || s->keep) continue;  // keep: an undo stack needs the content
         switch (s->kind) {
           case ContentKind::String:
           case ContentKind::Any:
@@ -280,6 +294,19 @@ void Doc::cleanupTransaction(Transaction& tx) {
   }
 
   if (validateAfterTx_ && std::uncaught_exceptions() == 0) validate();
+}
+
+uint64_t Doc::onAfterTransaction(TransactionHandler fn) {
+  uint64_t handle = nextHandle_++;
+  afterTxHandlers_.emplace_back(handle, std::move(fn));
+  return handle;
+}
+
+void Doc::offAfterTransaction(uint64_t handle) {
+  afterTxHandlers_.erase(
+      std::remove_if(afterTxHandlers_.begin(), afterTxHandlers_.end(),
+                     [&](const auto& p) { return p.first == handle; }),
+      afterTxHandlers_.end());
 }
 
 uint64_t Doc::onUpdate(UpdateHandler fn) {

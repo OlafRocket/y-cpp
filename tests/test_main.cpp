@@ -838,6 +838,158 @@ TEST(on_update_covers_remote_applies) {
   checkEq(c.getText().toString(), std::string("via relay"), "relayed content");
 }
 
+// ----------------------------------------------------------------- undo
+
+TEST(undo_basic_text) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  ycpp::UndoManager um(d, {t});
+  t.insert(0, "hello");
+  check(um.canUndo(), "captured");
+  check(um.undo(), "undo performed");
+  checkEq(t.toString(), std::string(""), "insert undone");
+  check(um.canRedo(), "redoable");
+  check(um.redo(), "redo performed");
+  checkEq(t.toString(), std::string("hello"), "insert redone");
+  check(um.undo(), "undo again");
+  checkEq(t.toString(), std::string(""), "back to empty");
+}
+
+TEST(undo_capture_grouping) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  ycpp::UndoManager um(d, {t});
+  t.insert(0, "aa");
+  t.insert(2, "bb");     // within capture timeout: same group
+  um.stopCapturing();
+  t.insert(4, "cc");     // new group
+  checkEq(um.undoStackSize(), size_t(2), "two capture groups");
+  um.undo();
+  checkEq(t.toString(), std::string("aabb"), "last group undone");
+  um.undo();
+  checkEq(t.toString(), std::string(""), "first group undone");
+}
+
+TEST(undo_delete_revives_content) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  ycpp::UndoManager um(d, {t});
+  t.insert(0, "hello world");
+  um.stopCapturing();
+  t.remove(2, 5);  // "llo w"
+  checkEq(t.toString(), std::string("heorld"), "deleted");
+  check(um.undo(), "undo delete");
+  checkEq(t.toString(), std::string("hello world"), "content revived");
+  check(um.redo(), "redo delete");
+  checkEq(t.toString(), std::string("heorld"), "delete redone");
+  check(um.undo(), "undo once more");
+  checkEq(t.toString(), std::string("hello world"), "revived again");
+}
+
+TEST(undo_is_selective_to_local_changes) {
+  // The heart of collaborative undo: undo reverts only tracked (local)
+  // changes; interleaved remote edits stay.
+  ycpp::Doc a(1), b(2);
+  auto ta = a.getText();
+  ycpp::UndoManager um(a, {ta});
+  ta.insert(0, "local1 ");
+  sync(a, b);
+  b.getText().insert(7, "remote ");                 // remote edit lands after
+  a.applyUpdate(b.encodeStateAsUpdate(a.encodeStateVector()), "network");
+  checkEq(ta.toString(), std::string("local1 remote "), "merged");
+  um.stopCapturing();
+  ta.insert(14, "local2");
+  checkEq(ta.toString(), std::string("local1 remote local2"), "all three");
+  um.undo();
+  checkEq(ta.toString(), std::string("local1 remote "), "local2 undone only");
+  um.undo();
+  checkEq(ta.toString(), std::string("remote "), "local1 undone, remote kept");
+  // And the undos converge on the other peer.
+  sync(a, b);
+  checkEq(b.getText().toString(), std::string("remote "), "undo syncs to b");
+}
+
+TEST(undo_remote_delete_of_local_text) {
+  // A remote peer deletes part of locally inserted text; undoing the local
+  // insert must not fail on the partially-deleted range.
+  ycpp::Doc a(1), b(2);
+  auto ta = a.getText();
+  ycpp::UndoManager um(a, {ta});
+  ta.insert(0, "abcdef");
+  sync(a, b);
+  b.getText().remove(1, 2);  // remote deletes "bc"
+  a.applyUpdate(b.encodeStateAsUpdate(a.encodeStateVector()), "network");
+  checkEq(ta.toString(), std::string("adef"), "remote delete applied");
+  um.undo();
+  checkEq(ta.toString(), std::string(""), "local insert fully undone");
+  sync(a, b);
+  checkEq(b.getText().toString(), std::string(""), "converged");
+}
+
+TEST(undo_map_set) {
+  ycpp::Doc d(1);
+  auto m = d.getMap("m");
+  ycpp::UndoManager um(d, {m});
+  m.set("k", ycpp::Any::of(int64_t{1}));
+  um.stopCapturing();
+  m.set("k", ycpp::Any::of(int64_t{2}));
+  um.undo();
+  checkEq(m.get("k")->any.integer(), int64_t{1}, "map value restored");
+  um.undo();
+  check(!m.has("k"), "first set undone -> key gone");
+  um.redo();
+  checkEq(m.get("k")->any.integer(), int64_t{1}, "redo restores value 1");
+  um.redo();
+  checkEq(m.get("k")->any.integer(), int64_t{2}, "redo restores value 2");
+}
+
+TEST(undo_new_edit_clears_redo) {
+  ycpp::Doc d(1);
+  auto t = d.getText();
+  ycpp::UndoManager um(d, {t});
+  t.insert(0, "one");
+  um.undo();
+  check(um.canRedo(), "redo available");
+  t.insert(0, "two");  // fresh change invalidates redo
+  check(!um.canRedo(), "redo cleared by new edit");
+  checkEq(t.toString(), std::string("two"), "state consistent");
+}
+
+TEST(undo_scope_filtering) {
+  ycpp::Doc d(1);
+  auto t1 = d.getText("one");
+  auto t2 = d.getText("two");
+  ycpp::UndoManager um(d, {t1});  // only t1 in scope
+  t1.insert(0, "tracked");
+  um.stopCapturing();
+  t2.insert(0, "untracked");
+  checkEq(um.undoStackSize(), size_t(1), "t2 changes not captured");
+  um.undo();
+  checkEq(t1.toString(), std::string(""), "t1 undone");
+  checkEq(t2.toString(), std::string("untracked"), "t2 untouched");
+}
+
+TEST(undo_wire_validity_and_positions) {
+  // Undo/redo produce ordinary updates: a fresh doc replaying them matches,
+  // and relative positions follow revived content (followRedone).
+  ycpp::Doc a(1);
+  auto t = a.getText();
+  ycpp::UndoManager um(a, {t});
+  t.insert(0, "the quick fox");
+  um.stopCapturing();
+  auto rel = ycpp::createRelativePosition(t, 10);  // before "fox"
+  t.remove(0, 13);
+  um.undo();  // revive everything
+  checkEq(t.toString(), std::string("the quick fox"), "revived");
+  auto abs = ycpp::resolveRelativePosition(rel, a);
+  check(abs.has_value(), "position resolves through redone chain");
+  checkEq(ycpp::utf::utf16To8(t.toUtf16().substr(abs->index, 3)), std::string("fox"),
+          "anchor follows revived content");
+  ycpp::Doc fresh(9);
+  fresh.applyUpdate(a.encodeStateAsUpdate());
+  checkEq(fresh.getText().toString(), t.toString(), "undo history replays cleanly");
+}
+
 // ----------------------------------------------------------- compaction
 
 TEST(compaction_sequential_typing) {

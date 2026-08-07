@@ -20,3 +20,4 @@
 #include "ycpp/wrappers.hpp"  // Text / Array / Map public handles
 #include "ycpp/doc.hpp"       // Doc: store, transactions, update codec
 #include "ycpp/position.hpp"  // relative positions (content-anchored cursors)
+#include "ycpp/undo.hpp"      // UndoManager: selective collaborative undo/redo

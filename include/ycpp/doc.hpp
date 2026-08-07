@@ -22,6 +22,7 @@ namespace ycpp {
 
 struct RelativePosition;
 struct AbsolutePosition;
+class UndoManager;
 
 struct DeleteRange {
   uint64_t clock = 0;
@@ -58,6 +59,22 @@ class Doc {
   using UpdateHandler = std::function<void(const std::vector<uint8_t>&, const std::string&)>;
   uint64_t onUpdate(UpdateHandler fn);
   void offUpdate(uint64_t handle);
+
+  // Fired at the end of every transaction, after type observers and before
+  // garbage collection (so handlers may still mark content keep) — the yjs
+  // "afterTransaction" event, consumed by the UndoManager. The pointer
+  // members are only valid during the callback.
+  struct TransactionEvent {
+    std::string origin;
+    bool local = true;
+    const std::map<uint64_t, uint64_t>* beforeState = nullptr;
+    std::map<uint64_t, uint64_t> afterState;
+    const std::map<uint64_t, std::vector<DeleteRange>>* deleteSet = nullptr;
+    std::vector<YType*> changedTypes;
+  };
+  using TransactionHandler = std::function<void(const TransactionEvent&)>;
+  uint64_t onAfterTransaction(TransactionHandler fn);
+  void offAfterTransaction(uint64_t handle);
 
   // RAII variant of onUpdate(): the handler detaches when the returned
   // Subscription is destroyed or reset().
@@ -96,6 +113,11 @@ class Doc {
   friend class Array;
   friend class Map;
   friend std::optional<AbsolutePosition> resolveRelativePosition(const RelativePosition&, Doc&);
+  friend class UndoManager;
+
+  // yjs followRedone: chase an item's redone chain to its current live
+  // incarnation; returns the containing item and the offset within it.
+  std::pair<Item*, uint64_t> followRedone(const ID& id) const;
 
   struct Transaction {
     std::map<uint64_t, uint64_t> beforeState;
@@ -183,6 +205,7 @@ class Doc {
   int txDepth_ = 0;
   uint64_t nextHandle_ = 1;  // observer / update-handler handles
   std::vector<std::pair<uint64_t, UpdateHandler>> updateHandlers_;
+  std::vector<std::pair<uint64_t, TransactionHandler>> afterTxHandlers_;
   // Liveness token for Subscriptions: expires with the Doc.
   std::shared_ptr<void> aliveToken_ = std::make_shared<int>(0);
 

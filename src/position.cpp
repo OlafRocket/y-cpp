@@ -45,9 +45,7 @@ std::optional<AbsolutePosition> resolveRelativePosition(const RelativePosition& 
   uint64_t index = 0;
   if (rpos.item) {
     if (doc.getState(rpos.item->client) <= rpos.item->clock) return std::nullopt;
-    const auto& v = doc.store_.at(rpos.item->client);
-    Item* right = v[findIndex(v, rpos.item->clock)];
-    uint64_t diff = rpos.item->clock - right->id.clock;
+    auto [right, diff] = doc.followRedone(*rpos.item);  // follow undo re-creations
     if (right->kind == ContentKind::GC) return std::nullopt;  // anchor collected
     type = right->parent;
     if (type == nullptr) return std::nullopt;
@@ -64,7 +62,7 @@ std::optional<AbsolutePosition> resolveRelativePosition(const RelativePosition& 
     index = rpos.assoc >= 0 ? type->length : 0;
   } else if (rpos.typeId) {
     if (doc.getState(rpos.typeId->client) <= rpos.typeId->clock) return std::nullopt;
-    Item* item = doc.getItem(*rpos.typeId);
+    Item* item = doc.followRedone(*rpos.typeId).first;
     if (item->kind != ContentKind::Type || item->typeContent() == nullptr) {
       return std::nullopt;  // type item was garbage collected
     }
