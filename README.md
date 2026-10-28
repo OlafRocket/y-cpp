@@ -104,6 +104,15 @@ Tests:
   the reference yjs implementation via Node (auto-`npm install`s yjs; skipped
   if node is not found), plus an end-to-end test of the `ycpp-sync` live
   server with concurrent yjs peers over WebSocket
+- Version matrix: the default `interop` job uses the yjs version pinned in
+  `tests/interop/package.json`; `interop-yjs13-latest` (CMake option
+  `YCPP_INTEROP_LATEST13`, on by default) runs the same suite against the
+  latest yjs 13.x, and `-DYCPP_INTEROP_V14_SPEC=@y/y@14.0.0-rc.29` adds an
+  optional job against a yjs 14 release candidate. Extra versions are
+  installed once under `tests/interop/.yjs-versions/`
+- `tools/upstream-diff.sh [TAG]` prints what changed in the yjs core files
+  that y-cpp mirrors since the pinned tag; see `docs/MINIMAL_FEATURES.md`
+  section 4 and `docs/UPSTREAM_TRACKING.md`
 
 ## CLI
 

@@ -323,8 +323,15 @@ Item* UndoManager::redoItem(Item* item, const std::unordered_set<Item*>& redoIte
         return nullptr;  // conflicts with a newer change from another client
       }
     } else {
-      auto mit = item->parent->map.find(*item->parentSub);
-      left = mit == item->parent->map.end() ? nullptr : mit->second;
+      auto mit = parentType->map.find(*item->parentSub);
+      left = mit == parentType->map.end() ? nullptr : mit->second;
+    }
+    // Drop a cross-parent left: its origin would make the encoder omit the
+    // parent info and remote peers would attach the redone item to the old,
+    // deleted parent (yjs #757, v13.6.31).
+    if (left != nullptr && parentOf(left) != parentItem) {
+      auto mit = parentType->map.find(*item->parentSub);
+      left = mit == parentType->map.end() ? nullptr : mit->second;
     }
   }
 

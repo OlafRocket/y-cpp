@@ -8,8 +8,9 @@ without changing the core.
 
 Reference implementations used while writing this code:
 
-- [yjs (v13.6.x)](https://github.com/yjs/yjs) — the canonical JavaScript
-  implementation (cloned in `/mnt/work/crdt/yjs`)
+- [yjs](https://github.com/yjs/yjs), the canonical JavaScript
+  implementation (cloned in `/mnt/work/crdt/yjs`). Port baseline v13.6.27,
+  pinned reference v13.6.33; see section 4 and `docs/UPSTREAM_TRACKING.md`
 - [y-octo](https://github.com/y-crdt/y-octo) — a Rust implementation of the
   same protocol
 - [docs.yjs.dev](https://docs.yjs.dev/) — user-level documentation,
@@ -183,3 +184,37 @@ Implemented since 0.3 (was out of scope in 0.1):
    converge to identical text. This is the actual conformity check.
 4. **Live browser test** — `web/index.html` runs two real Yjs peers and can
    exchange base64 updates with the `ycpp` CLI.
+
+## 4. Upstream review
+
+Pinned yjs tag: v13.6.33 (2026-09-23). The port baseline is v13.6.27; the
+differences between the two tags are classified in
+`docs/UPSTREAM_TRACKING.md`, which also records the yjs 14 and y-octo
+findings.
+
+Core files watched in the yjs clone (`/mnt/work/crdt/yjs`):
+
+| Area | Files |
+|---|---|
+| structs | `src/structs/Item.js`, `src/structs/Content*.js`, `src/structs/GC.js`, `src/structs/Skip.js` |
+| store and transactions | `src/utils/StructStore.js`, `src/utils/Transaction.js`, `src/utils/DeleteSet.js` |
+| codec | `src/utils/UpdateEncoder.js`, `src/utils/UpdateDecoder.js`, `src/utils/encoding.js`, `src/utils/updates.js` |
+| features | `src/utils/UndoManager.js`, `src/utils/RelativePosition.js`, `src/utils/ID.js` |
+| types | `src/types/YText.js`, `src/types/YArray.js`, `src/types/YMap.js`, `src/types/AbstractType.js` |
+| y-protocols (separate package, pinned 1.0.7 in `tests/interop/package.json`) | `sync.js`, `awareness.js` |
+
+Procedure for a new upstream tag:
+
+1. `git -C /mnt/work/crdt/yjs fetch --tags`
+2. `tools/upstream-diff.sh vX.Y.Z` prints the stat and the diff of the core
+   files between the pin and the tag (`tools/upstream-diff.sh` alone diffs
+   against the clone's HEAD).
+3. Classify every hunk as one of: convergence or encoding change (mirror it
+   in y-cpp and add a test), feature not ported, irrelevant. Record the
+   result in `docs/UPSTREAM_TRACKING.md` with the y-cpp file and function.
+4. Run the interop suite against the tag:
+   `YCPP_INTEROP_YJS=yjs@X.Y.Z tests/interop/run_interop.sh build/ycpp`.
+   The ctest job `interop-yjs13-latest` (CMake option `YCPP_INTEROP_LATEST13`,
+   on by default) does the same for the latest 13.x; `YCPP_INTEROP_V14_SPEC`
+   adds an optional job for a yjs 14 package.
+5. Update the "Pinned yjs tag" line above; the script reads the pin from it.

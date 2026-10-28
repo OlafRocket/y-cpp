@@ -1,7 +1,7 @@
 // Conformity tests: exchange real binary updates between the reference yjs
 // implementation and the ycpp CLI. Usage: node interop.test.js <path-to-ycpp>
 'use strict'
-const Y = require('yjs')
+const { Y, name: yjsName, version: yjsVersion, isV14 } = require('./yjs-compat')
 const { execFileSync } = require('child_process')
 const fs = require('fs')
 const os = require('os')
@@ -13,6 +13,7 @@ if (!YCPP) {
   process.exit(2)
 }
 
+console.log(`yjs under test: ${yjsName}@${yjsVersion}${isV14 ? ' (v14 shim)' : ''}`)
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ycpp-interop-'))
 let failures = 0
 let testName = ''
@@ -55,9 +56,15 @@ const syncBoth = (ydoc, cppDoc) => {
   Y.applyUpdate(ydoc, cppDoc.diff(Y.encodeStateVector(ydoc)))
 }
 
-const test = (name, fn) => {
+// opts.skipV14: a reason string; the test is reported as skipped under a
+// yjs 14 package because of a documented, intended upstream difference.
+const test = (name, fn, opts = {}) => {
   testName = name
   const before = failures
+  if (isV14 && opts.skipV14) {
+    console.log(`skip ${name} (v14: ${opts.skipV14})`)
+    return
+  }
   try {
     fn()
   } catch (e) {
@@ -246,7 +253,7 @@ test('yjs map/array applied by ycpp', () => {
   const j = cpp.json()
   check(deepEq(j.list, list.toJSON()), 'array transferred')
   check(deepEq(j.meta, meta.toJSON()), 'map with nesting transferred')
-})
+}, { skipV14: 'nested nodes created by v14 are encoded with the XmlFragment type ref' })
 
 test('ycpp map/array applied by yjs', () => {
   const cpp = new CppDoc(5001)
@@ -301,6 +308,71 @@ test('binary values survive the cpp round-trip', () => {
   const back = ydoc2.getMap('m').get('bytes')
   check(back instanceof Uint8Array && Buffer.from(back).equals(Buffer.from([0, 1, 2, 250, 255])),
         'bytes identical after cpp re-encode')
+})
+
+// Uniform peer interface over a yjs doc, matching CppDoc, for multi-peer
+// scenarios where the roles are swapped between implementations.
+class YPeer {
+  constructor () { this.doc = new Y.Doc(); this.text = this.doc.getText('default') }
+  insert (index, text) { this.text.insert(index, text) }
+  remove (index, len) { this.text.delete(index, len) }
+  show () { return this.text.toString() }
+  sv () { return Y.encodeStateVector(this.doc) }
+  diff (sv) { return Y.encodeStateAsUpdate(this.doc, sv) }
+  apply (update) { Y.applyUpdate(this.doc, update) }
+}
+const push = (from, to) => to.apply(from.diff(to.sv()))
+
+test('insert before a leading tombstone converges (y-octo #53)', () => {
+  // c0 writes "a"; c1 appends "b" after it; c0 inserts "c" and deletes "a";
+  // c2, knowing only c0's state, inserts "d" at index 0 in front of the
+  // tombstone. origin and rightOrigin of "d" must be adjacent or c1 and c2
+  // diverge. Both role assignments put ycpp in the position that matters.
+  for (const cppRole of ['c2', 'c1']) {
+    const mk = (role, id) => (role === cppRole ? new CppDoc(id) : new YPeer())
+    const c0 = new YPeer()
+    const c1 = mk('c1', 7001)
+    const c2 = mk('c2', 7002)
+    c0.insert(0, 'a')
+    push(c0, c1)
+    c1.insert(1, 'b')
+    c0.insert(1, 'c')
+    c0.remove(0, 1)
+    push(c0, c2)
+    c2.insert(0, 'd')
+    push(c1, c2)
+    push(c2, c1)
+    checkEq(c1.show(), c2.show(), `c1 and c2 converge (cpp as ${cppRole})`)
+    push(c1, c0)
+    push(c2, c0)
+    checkEq(c0.show(), c1.show(), `c0 converges (cpp as ${cppRole})`)
+    checkEq(c0.show().length, 3, `d, c and b present (cpp as ${cppRole})`)
+  }
+})
+
+test('update with a mid-stream Skip struct (yjs 14 store shape)', () => {
+  // A yjs 14 store tolerates clock gaps and emits Skip structs between runs
+  // of one client in ordinary updates. yjs 13 produces the same shape with
+  // mergeUpdates over non-adjacent updates.
+  const ydoc = new Y.Doc()
+  const t = ydoc.getText('default')
+  t.insert(0, 'one')
+  const u1 = Y.encodeStateAsUpdate(ydoc)
+  const sv1 = Y.encodeStateVector(ydoc)
+  t.insert(3, ' two')
+  const u2 = Y.encodeStateAsUpdate(ydoc, sv1)
+  const sv2 = Y.encodeStateVector(ydoc)
+  t.insert(7, ' three')
+  const u3 = Y.encodeStateAsUpdate(ydoc, sv2)
+  const merged = Y.mergeUpdates([u1, u3])  // clocks [0,3) and [7,13): Skip in between
+  const cpp = new CppDoc(2005)
+  cpp.apply(Buffer.from(merged))
+  checkEq(cpp.show(), 'one', 'structs behind the Skip stay pending')
+  cpp.apply(Buffer.from(u2))
+  checkEq(cpp.show(), 'one two three', 'gap filled, pending structs integrated')
+  const back = new Y.Doc()
+  Y.applyUpdate(back, cpp.export())
+  checkEq(back.getText('default').toString(), 'one two three', 'cpp re-encode readable by yjs')
 })
 
 test('ycpp doc file is a valid yjs update', () => {

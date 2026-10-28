@@ -71,6 +71,7 @@ Testing/
 # interop test deps
 tests/interop/node_modules/
 tests/interop/package-lock.json
+tests/interop/.yjs-versions/
 
 # ycpp doc files
 *.ydoc

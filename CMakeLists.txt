@@ -64,6 +64,27 @@ if(NODE_EXECUTABLE)
                    $<TARGET_FILE:ycpp-cli>)
   set_tests_properties(interop PROPERTIES
     ENVIRONMENT "NODE=${NODE_EXECUTABLE}")
+  # Extra interop jobs against other yjs versions, so an upstream behaviour
+  # change fails a test. Each version is installed on first run under
+  # tests/interop/.yjs-versions/. The default job stays on the version pinned
+  # in tests/interop/package.json.
+  option(YCPP_INTEROP_LATEST13 "Interop job against the latest yjs 13.x (npm spec yjs@13)" ON)
+  set(YCPP_INTEROP_V14_SPEC "" CACHE STRING
+    "npm spec of a yjs 14 package for an optional interop job, e.g. @y/y@14.0.0-rc.29 (empty: off)")
+  if(YCPP_INTEROP_LATEST13)
+    add_test(NAME interop-yjs13-latest
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interop/run_interop.sh
+                     $<TARGET_FILE:ycpp-cli>)
+    set_tests_properties(interop-yjs13-latest PROPERTIES
+      ENVIRONMENT "NODE=${NODE_EXECUTABLE};YCPP_INTEROP_YJS=yjs@13")
+  endif()
+  if(YCPP_INTEROP_V14_SPEC)
+    add_test(NAME interop-yjs14
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interop/run_interop.sh
+                     $<TARGET_FILE:ycpp-cli>)
+    set_tests_properties(interop-yjs14 PROPERTIES
+      ENVIRONMENT "NODE=${NODE_EXECUTABLE};YCPP_INTEROP_YJS=${YCPP_INTEROP_V14_SPEC}")
+  endif()
   if(YCPP_BUILD_SYNC)
     add_test(NAME websocket
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interop/run_ws_test.sh

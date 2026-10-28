@@ -13,10 +13,10 @@ Recommended pin after this review: v13.6.33.
 
 | Source | State used for this report | Clone state |
 |---|---|---|
-| yjs 13.x tags v13.6.28 to v13.6.33 | GitHub release tarballs | `/mnt/work/crdt/yjs` is at v13.6.27 (987c9eb, 2025-05-13); the six later tags are not fetched |
+| yjs 13.x tags v13.6.28 to v13.6.33 | GitHub release tarballs | `/mnt/work/crdt/yjs` is checked out at v13.6.27 (987c9eb, 2025-05-13); tags fetched 2026-10-28, so `tools/upstream-diff.sh` can diff against them |
 | yjs v14 | v14.0.0-rc.29 tarball (2026-10-15, npm package `@y/y`) | `/mnt/work/crdt/yjs-v14` is at rc.24 (ceae18f, 2026-08-04); rc.25 to rc.29 change the core files by under 30 lines each except BlockSet.js (+55/-71); `ytype.js` is renamed `ynode.js`; INTERNALS.md and attributing-content.md are identical to rc.29 |
 | y-protocols | v1.0.7 tag and master (1.0.6-rc.1, the v14 line) tarballs | no clone; `tests/interop/node_modules/y-protocols` is 1.0.7 and byte-identical to the tag |
-| y-octo | GitHub commits, PRs and issues since 2025-05-01 | `/mnt/work/crdt/y-octo` is a single-commit checkout of PR #59 (3936a47, 2026-07-30), so it carries no history; upstream has ten later commits, one substantive (#70) |
+| y-octo | GitHub commits, PRs and issues since 2025-05-01 | `/mnt/work/crdt/y-octo` is a single-commit checkout of PR #59 (3936a47, 2026-07-30), so it carries no history; `origin/main` fetched 2026-10-28 has ten later commits, one substantive (#70) |
 
 Interop suite: `tests/interop/package.json` asks for `yjs ^13.6.27`;
 `package-lock.json` and the installed `node_modules/yjs` resolve to
@@ -41,7 +41,7 @@ Hunks in the core file list:
 |---|---|---|---|---|
 | v13.6.29 | Transaction.js `cleanupTransactions` | Deep-event dispatch, the `afterTransaction` emit and YText formatting cleanup are queued through `callAll` so a throwing deep handler no longer skips the rest (commit cff7de11) | Irrelevant: deep observers and formatting are not ported; event ordering, not state | `Doc::cleanupTransaction` (src/transaction.cpp), no change |
 | v13.6.30 | DeleteSet.js `sortAndMergeDeleteSet` | Merging allocates a new `DeleteItem` instead of mutating the shared one; `mergeDeleteSets` no longer corrupts its inputs, which made `snapshotContainsUpdate` return true wrongly (#767) | Irrelevant: no wire change; y-cpp delete ranges are value types and every merge builds a new vector; snapshots are not ported | `Doc::cleanupTransaction` step 1 (src/transaction.cpp), `Doc::writeDeleteSet` (src/update_codec.cpp), `UndoManager::dsSortAndMerge` (src/undo.cpp), no change |
-| v13.6.31 | Item.js `redoItem`, map (`parentSub`) branch | After `left` is chosen for a map item, it is dropped when `left.parent._item` is not the (possibly redone) target parent, and re-read from `parentType._map`. Without this the redone item carried an `origin` inside the deleted old parent, the encoder omitted parent info (origin present), and remote peers attached the item to the deleted type: the restored key was missing after sync while the local doc was correct (#757) | Encoding and convergence fix: must be mirrored | `UndoManager::redoItem`, map branch (src/undo.cpp:311-328). Two corrections: (a) the else branch reads `item->parent->map`, upstream reads `parentType._map` (the redone parent) since before v13.6.27; (b) add the cross-parent check from v13.6.31. Trigger in y-cpp terms: nested Y.Map in a Y.Array, set a key and delete the map in one capture group, undo, sync |
+| v13.6.31 | Item.js `redoItem`, map (`parentSub`) branch | After `left` is chosen for a map item, it is dropped when `left.parent._item` is not the (possibly redone) target parent, and re-read from `parentType._map`. Without this the redone item carried an `origin` inside the deleted old parent, the encoder omitted parent info (origin present), and remote peers attached the item to the deleted type: the restored key was missing after sync while the local doc was correct (#757) | Encoding and convergence fix: must be mirrored | `UndoManager::redoItem`, map branch (src/undo.cpp:311-328). Two corrections: (a) the else branch reads `item->parent->map`, upstream reads `parentType._map` (the redone parent) since before v13.6.27; (b) add the cross-parent check from v13.6.31. Trigger in y-cpp terms: nested Y.Map in a Y.Array, set a key and delete the map in one capture group, undo, sync. Before the fix this scenario aborted in `Doc::validate` (map value not the rightmost item); unit test `undo_map_key_then_parent_delete_syncs` |
 | v13.6.32 | UndoManager.js constructor, `destroy` | `destroy` is bound once and removed from the doc `destroy` event on `destroy()` (#797, handler leak) | Irrelevant: lifecycle, no state | `UndoManager::~UndoManager` unregisters its `afterTransaction` handler (src/undo.cpp); `Doc` has no destroy event; no change |
 | v13.6.33 | Transaction.js `cleanupTransactions` | `currentTarget` and `_path` of deep events are set immediately before calling each type's handlers because one event instance is shared by all ancestors (#768, #801) | Irrelevant: deep observers not ported | none |
 
@@ -65,6 +65,7 @@ next to it.
 |---|---|---|
 | v1 update layout | Unchanged | `Item.write` differs from v13 only by an `offsetEnd` parameter (used to write partial structs for `intersectUpdateWithContentIds`); info bits, origin, rightOrigin, parent info and parentSub are the same |
 | Content refs 0 to 10 | Unchanged | `contentRefs` in ynode.js lists the same eleven entries; `readContentDeleted`, `JSON`, `Binary`, `String`, `Embed`, `Format`, `Any` are byte-identical to v13; `ContentType` still writes the type ref and the XmlElement or XmlHook name (`_legacyTypeRef`); `ContentDoc` still writes guid string and opts Any |
+| Type ref of nested types | Layout unchanged, value changed | A `YNode` created locally by v14 carries `_legacyTypeRef` 4 (unnamed, the former YXmlFragment ref) or 3 (named), whatever it is used for; decoded nodes keep the ref they were received with. See 3.4 |
 | Delete set section | Unchanged | `writeIdSet` writes numClients, client, numRanges, clock, len with the V1 varuint encoders; `DSEncoderV1` is renamed `IdSetEncoderV1` |
 | State vector | Unchanged | `writeStateVector` and `readStateVector` unchanged |
 | Default codec | v1 | `applyUpdate`, `encodeStateAsUpdate`, `encodeStateVector` are the V1 entry points; `encodeStateVectorV2` and friends are separate |
@@ -105,6 +106,16 @@ and byte-identical in layout. Two things a 13.x peer sees more often:
 | `Skip` structs in an ordinary state update | Decoded, following structs parked as pending | Same (`Doc::applyUpdate`, `Doc::integrateLoop`) |
 | 53-bit client IDs | Decoded (JavaScript number) | `uint64_t` throughout |
 
+Readable but interpreted differently: a nested type created by a v14 peer
+(a `YNode` placed in a map or array) is encoded with type ref 4 or 3. A
+13.x peer decodes it as `Y.XmlFragment` or `Y.XmlElement`, not as the
+`Y.Map`, `Y.Array` or `Y.Text` the application expects; y-cpp decodes it
+as an XML kind (preserved on the wire, no API). Root types are not
+affected (their kind is chosen by the reader). Mixed 13.x and 14 peers
+therefore interoperate on root types and on nested types created by 13.x
+peers, not on nested types created by v14 peers. The optional v14 interop
+job skips the nested-type case for this reason.
+
 Not readable by a 13.x peer, and not sent through y-protocols: encoded
 IdMaps, ContentMaps and ContentIds (V2 only), used by the versioning,
 attribution and `undoContentIds` APIs.
@@ -138,8 +149,10 @@ pull requests touching the algorithm or the codec:
 
 | Action | Where | Priority |
 |---|---|---|
-| Mirror #757 and fix the map lookup in the redo path | `UndoManager::redoItem`, src/undo.cpp; test from undo-redo.tests.js `testUndoSetAttributeAndDeleteSyncsAttributes` with a Map in an Array | before next release |
-| Move the pin to v13.6.33 | docs/MINIMAL_FEATURES.md | with this review |
-| Record that the interop lock resolves 13.6.32, pin it explicitly | tests/interop/package.json, package-lock.json | with deliverable 4 |
-| Add the y-octo #53 scenario as a convergence test | tests/test_main.cpp, tests/interop/interop.test.js | next test pass |
-| Add a mid-stream `Skip` interop case (v14 store with gaps) | tests/interop/interop.test.js | with the v14 interop job |
+| Mirror #757 and fix the map lookup in the redo path | `UndoManager::redoItem`, src/undo.cpp; unit test `undo_map_key_then_parent_delete_syncs` | done 2026-10-28 |
+| Move the pin to v13.6.33 | docs/MINIMAL_FEATURES.md section 4 | done 2026-10-28 |
+| Pin the default interop job to the version the lock resolved (13.6.32) | tests/interop/package.json | done 2026-10-28 |
+| Add the y-octo #53 scenario as a convergence test | `sync_insert_before_leading_tombstone` (tests/test_main.cpp), `insert before a leading tombstone converges` (interop.test.js, both role assignments) | done 2026-10-28 |
+| Add a mid-stream `Skip` interop case (v14 store with gaps) | `update with a mid-stream Skip struct` (interop.test.js) | done 2026-10-28 |
+| Interop version matrix | ctest jobs `interop-yjs13-latest` (default on) and `interop-yjs14` (`YCPP_INTEROP_V14_SPEC`); loader tests/interop/yjs-compat.js | done 2026-10-28 |
+| Decoder hardening against malformed updates (clock overflow, length caps, cyclic parents), after y-octo #54 | src/update_codec.cpp, src/lib0.hpp | later, with a fuzz pass |

@@ -990,6 +990,62 @@ TEST(undo_wire_validity_and_positions) {
   checkEq(fresh.getText().toString(), t.toString(), "undo history replays cleanly");
 }
 
+TEST(undo_map_key_then_parent_delete_syncs) {
+  // yjs #757 (v13.6.31): setting a key on a nested map and deleting the map
+  // in the same capture group, then undoing, must re-encode the revived keys
+  // with explicit parent info. Before the fix the redone key carried an
+  // origin inside the deleted parent, so remote peers attached it to the
+  // deleted type and dropped it while the local doc looked correct.
+  ycpp::Doc a(1);
+  auto arr = a.getArray("root");
+  ycpp::UndoManager um(a, {arr});
+  auto m = arr.insertMap(0);
+  m.set("type", ycpp::Any::of("button"));
+  m.set("test", ycpp::Any::of(true));
+  um.stopCapturing();
+  m.set("type", ycpp::Any::of("paragraph"));
+  arr.remove(0, 1);
+  check(um.undo(), "undo performed");
+  const std::string local = arr.toJson();
+  check(local.find("button") != std::string::npos, "local: attribute value restored");
+  check(local.find("\"test\"") != std::string::npos, "local: untouched attribute restored");
+  ycpp::Doc b(2);
+  auto rb = b.getArray("root");
+  b.applyUpdate(a.encodeStateAsUpdate());
+  checkEq(rb.toJson(), local, "remote equals local after undo (#757)");
+  ycpp::Doc c(3);
+  auto rc = c.getArray("root");
+  c.applyUpdate(b.encodeStateAsUpdate());
+  checkEq(rc.toJson(), local, "re-encoded by the remote still equal");
+}
+
+TEST(sync_insert_before_leading_tombstone) {
+  // y-octo #53: an insert at index 0 while the first list item is a
+  // tombstone must keep origin and rightOrigin adjacent (origin null,
+  // rightOrigin the tombstone), otherwise peers diverge.
+  ycpp::Doc c0(10), c1(11), c2(12);
+  auto t0 = c0.getText();
+  auto t1 = c1.getText();
+  auto t2 = c2.getText();
+  auto push = [](ycpp::Doc& from, ycpp::Doc& to) {
+    to.applyUpdate(from.encodeStateAsUpdate(to.encodeStateVector()));
+  };
+  t0.insert(0, "a");
+  push(c0, c1);
+  t1.insert(1, "b");
+  t0.insert(1, "c");
+  t0.remove(0, 1);
+  push(c0, c2);
+  t2.insert(0, "d");
+  push(c1, c2);
+  push(c2, c1);
+  checkEq(t1.toString(), t2.toString(), "c1 and c2 converge");
+  push(c1, c0);
+  push(c2, c0);
+  checkEq(t0.toString(), t1.toString(), "c0 converges");
+  checkEq(t0.length(), uint64_t(3), "d, c and b present");
+}
+
 // ----------------------------------------------------------- compaction
 
 TEST(compaction_sequential_typing) {
