@@ -4,6 +4,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../tools/base64_io.hpp"
@@ -115,6 +116,48 @@ TEST(base64_roundtrip) {
     threw = true;
   }
   check(threw, "invalid character throws");
+}
+
+TEST(base64_vectors) {
+  // RFC 4648 section 10 test vectors.
+  const std::pair<std::string, std::string> vectors[] = {
+      {"", ""},         {"f", "Zg=="},         {"fo", "Zm8="},
+      {"foo", "Zm9v"},  {"foob", "Zm9vYg=="},  {"fooba", "Zm9vYmE="},
+      {"foobar", "Zm9vYmFy"},
+  };
+  for (const auto& [plain, encoded] : vectors) {
+    std::vector<uint8_t> bytes(plain.begin(), plain.end());
+    checkEq(ycpp_tools::base64Encode(bytes), encoded, "encode \"" + plain + "\"");
+    checkEq(ycpp_tools::base64Decode(encoded), bytes, "decode \"" + encoded + "\"");
+  }
+  // Round trip over every length 0..300 so all padding cases and the
+  // fast/slow decoder paths are exercised, with and without line breaks.
+  std::mt19937 rng(42);
+  for (size_t n = 0; n <= 300; n++) {
+    std::vector<uint8_t> in(n);
+    for (auto& b : in) b = static_cast<uint8_t>(rng());
+    std::string enc = ycpp_tools::base64Encode(in);
+    checkEq(enc.size(), (n + 2) / 3 * 4, "encoded length " + std::to_string(n));
+    checkEq(ycpp_tools::base64Decode(enc), in, "roundtrip len " + std::to_string(n));
+    std::string wrapped;
+    for (size_t i = 0; i < enc.size(); i++) {
+      if (i && i % 76 == 0) wrapped += "\r\n";
+      wrapped += enc[i];
+    }
+    wrapped += "\n";
+    checkEq(ycpp_tools::base64Decode(wrapped), in, "wrapped roundtrip len " + std::to_string(n));
+  }
+  // Strict padding: these must throw rather than decode a partial result.
+  const char* bad[] = {"Zm8", "Zm9vYg=", "Zm=9", "Zg===", "====", "Zm9vYg==Zg==", "Zg==\n=="};
+  for (const char* b : bad) {
+    bool threw = false;
+    try {
+      ycpp_tools::base64Decode(b);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    check(threw, std::string("rejects \"") + b + "\"");
+  }
 }
 
 // ----------------------------------------------------------------- local text

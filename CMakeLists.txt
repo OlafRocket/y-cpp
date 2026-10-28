@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ycpp VERSION 0.8.0 LANGUAGES CXX)
+project(ycpp VERSION 0.8.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # editor tooling (IntelliSense/clangd)
